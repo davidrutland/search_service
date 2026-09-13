@@ -110,18 +110,45 @@ class BrowserExecutor:
     thread.
 
     HTTP worker threads NEVER access Camoufox/Playwright objects.
+
+    The owner thread is persistent for the lifetime of the service.
+    Calls fail explicitly if the owner dies instead of hanging forever.
     """
 
     def __init__(self):
         self._condition = threading.Condition()
         self._tasks = []
         self._stopping = False
+        self._startup_error = None
+        self._ready = False
+
         self._thread = threading.Thread(
             target=self._run,
             name="camoufox-owner",
             daemon=True,
         )
+
         self._thread.start()
+
+        # Wait until Camoufox has either started successfully
+        # or failed. This prevents the first request racing startup.
+        with self._condition:
+            while (
+                not self._stopping
+                and self._startup_error is None
+                and not self._ready
+            ):
+                self._condition.wait()
+
+        if self._startup_error is not None:
+            raise RuntimeError(
+                "Camoufox failed during startup"
+            ) from self._startup_error
+
+        if not self._ready:
+            raise RuntimeError(
+                "Camoufox browser executor stopped during startup"
+            )
 
     def _run(self):
         camoufox = None
@@ -137,11 +164,18 @@ class BrowserExecutor:
 
             browser = camoufox.__enter__()
 
+            with self._condition:
+                self._ready = True
+                self._condition.notify_all()
+
             log.info("[-] CAMOUFOX READY")
 
             while True:
                 with self._condition:
-                    while not self._tasks and not self._stopping:
+                    while (
+                        not self._tasks
+                        and not self._stopping
+                    ):
                         self._condition.wait()
 
                     if self._stopping and not self._tasks:
@@ -154,20 +188,46 @@ class BrowserExecutor:
 
                 try:
                     result = task(browser)
-                except Exception as exc:
-                    future.set_exception(exc)
-                else:
-                    future.set_result(result)
 
-        except Exception:
-            log.exception("[-] CAMOUFOX OWNER FAILED")
+                except Exception as exc:
+                    if not future.cancelled():
+                        future.set_exception(exc)
+
+                else:
+                    if not future.cancelled():
+                        future.set_result(result)
+
+        except Exception as exc:
+            log.exception(
+                "[-] CAMOUFOX OWNER FAILED"
+            )
+
+            with self._condition:
+                self._startup_error = exc
+                self._stopping = True
+
+                pending = self._tasks
+                self._tasks = []
+
+                self._condition.notify_all()
+
+            for _, future in pending:
+                if not future.done():
+                    future.set_exception(exc)
 
         finally:
             if camoufox is not None:
                 try:
                     camoufox.__exit__(None, None, None)
                 except Exception:
-                    log.exception("[-] CAMOUFOX SHUTDOWN FAILED")
+                    log.exception(
+                        "[-] CAMOUFOX SHUTDOWN FAILED"
+                    )
+
+            with self._condition:
+                self._stopping = True
+                self._ready = False
+                self._condition.notify_all()
 
             log.info("[-] CAMOUFOX OWNER STOPPED")
 
@@ -175,28 +235,71 @@ class BrowserExecutor:
         future = concurrent.futures.Future()
 
         with self._condition:
+
             if self._stopping:
                 future.set_exception(
-                    RuntimeError("browser executor is stopping")
+                    RuntimeError(
+                        "Camoufox browser executor is stopped"
+                    )
                 )
-            else:
-                self._tasks.append((task, future))
-                self._condition.notify()
+                return future
+
+            if self._startup_error is not None:
+                future.set_exception(
+                    RuntimeError(
+                        "Camoufox browser executor failed"
+                    )
+                )
+                return future
+
+            if not self._thread.is_alive():
+                future.set_exception(
+                    RuntimeError(
+                        "Camoufox owner thread is dead"
+                    )
+                )
+                return future
+
+            self._tasks.append((task, future))
+            self._condition.notify()
 
         return future
 
     def call(self, task):
-        return self.submit(task).result()
+        future = self.submit(task)
+
+        try:
+            return future.result()
+
+        except Exception:
+            log.exception(
+                "[-] CAMOUFOX TASK FAILED"
+            )
+            raise
 
     def shutdown(self):
         with self._condition:
             self._stopping = True
             self._condition.notify_all()
 
-        self._thread.join()
+        if self._thread.is_alive():
+            self._thread.join(timeout=10)
+
+        if self._thread.is_alive():
+            log.error(
+                "[-] CAMOUFOX OWNER DID NOT STOP CLEANLY"
+            )
 
 
 browser_executor = None
+
+# Only one complete search/enhancement pipeline may run at a time.
+#
+# ThreadingHTTPServer can receive overlapping requests from Calivi.
+# Camoufox is intentionally single-owner/single-thread, so serialising
+# the complete search pipeline prevents requests from competing for
+# browser work and leaving abandoned work behind.
+SEARCH_LOCK = threading.Lock()
 
 
 def start_browser_executor():
@@ -1673,15 +1776,16 @@ def enhance_candidates(results, request_id):
     # ------------------------------------------------------------
     # Stage 1:
     #
-    # Launch HTTP retrieval for all five candidates in parallel.
+    # Launch HTTP retrieval for all candidates in parallel.
     # These workers NEVER touch the browser.
     # ------------------------------------------------------------
 
-    with concurrent.futures.ThreadPoolExecutor(
+    executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=len(candidates),
         thread_name_prefix="http-fetch",
-    ) as executor:
+    )
 
+    try:
         future_map = {
             executor.submit(
                 fetch_http,
@@ -1704,9 +1808,6 @@ def enhance_candidates(results, request_id):
 
         for future in concurrent.futures.as_completed(future_map):
             index, result = future_map[future]
-
-            if usable_count >= TARGET_USABLE_ARTICLES:
-                break
 
             try:
                 html_source, http_reason = future.result()
@@ -1833,8 +1934,6 @@ def enhance_candidates(results, request_id):
                         exc,
                     )
 
-                    quality_reason = f"camoufox_error:{exc}"
-
             # ----------------------------------------------------
             # If neither route produced a usable article, preserve
             # the normal search result/snippet.
@@ -1864,17 +1963,29 @@ def enhance_candidates(results, request_id):
                     index,
                 )
 
+                # Stop immediately. Do not wait for another future
+                # to complete before leaving the loop.
+                if usable_count >= TARGET_USABLE_ARTICLES:
+                    break
+
         # --------------------------------------------------------
         # Cancel anything which has not begun.
         #
-        # Already-running HTTP requests are allowed to finish.
-        # We do NOT perform any browser work for candidates after
-        # the usable-article target has been reached.
+        # Already-running HTTP requests are NOT waited for here.
         # --------------------------------------------------------
 
         for future in future_map:
             if not future.done():
                 future.cancel()
+
+    finally:
+        # Wait for already-running HTTP workers to terminate.
+        # This prevents abandoned workers from leaking into the next
+        # Calivi request.
+        executor.shutdown(
+            wait=True,
+            cancel_futures=True,
+        )
 
     # ------------------------------------------------------------
     # Rebuild original result ordering.
@@ -1935,6 +2046,28 @@ def enhance_candidates(results, request_id):
 # HTTP SERVER
 # ============================================================
 
+def log_calivi_payload(request_id, data):
+    try:
+        payload = json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        log.info(
+            "[%s] CALIVI PAYLOAD BEGIN\\n%s\\n[%s] CALIVI PAYLOAD END",
+            request_id,
+            payload,
+            request_id,
+        )
+
+    except Exception:
+        log.exception(
+            "[%s] FAILED TO LOG CALIVI PAYLOAD",
+            request_id,
+        )
+
+
 class SearchHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -1948,37 +2081,45 @@ class SearchHandler(BaseHTTPRequestHandler):
                     for key, item in value.items()
                     if key != "_is_hub"
                 }
-
             if isinstance(value, list):
                 return [
                     clean_internal_markers(item)
                     for item in value
                 ]
-
             return value
 
         data = clean_internal_markers(data)
+
+        log_calivi_payload(
+            getattr(self, "request_id", "-"),
+            data,
+        )
 
         body = json.dumps(
             data,
             ensure_ascii=False,
         ).encode("utf-8")
 
-        self.send_response(status)
+        try:
+            self.send_response(status)
+            self.send_header(
+                "Content-Type",
+                "application/json; charset=utf-8",
+            )
+            self.send_header(
+                "Content-Length",
+                str(len(body)),
+            )
+            self.end_headers()
+            self.wfile.write(body)
+            return True
 
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8",
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
-
-        self.end_headers()
-
-        self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            log.info(
+                "[%s] CLIENT DISCONNECTED before response was sent",
+                getattr(self, "request_id", "-"),
+            )
+            return False
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -2036,19 +2177,31 @@ class SearchHandler(BaseHTTPRequestHandler):
             return
 
         request_id = uuid.uuid4().hex[:8]
+        self.request_id = request_id
         request_start = time.perf_counter()
 
         try:
-            results = search(
-                query,
-                limit,
-                request_id,
-            )
+            with SEARCH_LOCK:
+                log.info(
+                    "[%s] SEARCH PIPELINE LOCK ACQUIRED",
+                    request_id,
+                )
 
-            enhanced = enhance_candidates(
-                results,
-                request_id,
-            )
+                results = search(
+                    query,
+                    limit,
+                    request_id,
+                )
+
+                enhanced = enhance_candidates(
+                    results,
+                    request_id,
+                )
+
+                log.info(
+                    "[%s] SEARCH PIPELINE LOCK RELEASED",
+                    request_id,
+                )
 
             total = time.perf_counter() - request_start
 
