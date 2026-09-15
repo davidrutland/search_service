@@ -1,6 +1,8 @@
 # search_service v4.0
 
 A lean, high-precision retrieval service for LLMs. It searches DuckDuckGo/Brave, fetches articles, and returns **only** high-signal, deep-article snippets (no hubs, no noise).
+This is made for me, names and paths are relative to my system so I can just drop this in
+You are not me. Change them before use
 
 ## Features
 
