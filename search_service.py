@@ -1,1243 +1,2399 @@
 #!/usr/bin/env python3
-
 """
-search_service.py v3.5 - FIXED
+search_service v4.0
 
-A robust retrieval service that:
-1. Searches DuckDuckGo (primary) and Brave (fallback).
-2. Fetches article content via HTTP (preferred) or Camoufox (fallback).
-3. Enforces strict SSRF policies at every hop (reject if ANY resolved IP is private/reserved).
-4. Returns structured, provenance-rich results.
-5. ENFORCES TARGET_USABLE_ARTICLES to prevent timeout and ensure correct output format.
+Lean, high-precision web retrieval service for LLMs.
+
+Pipeline:
+
+    DuckDuckGo
+        ↓
+    Brave fallback
+        ↓
+    canonicalise / deduplicate / SSRF validation
+        ↓
+    discard obvious hubs
+        ↓
+    HTTP fetch
+        ↓
+    Readability extraction
+        ↓
+    article-quality / link-density filtering
+        ↓
+    Camoufox fallback for JS-heavy pages
+        ↓
+    LexRank summary
+        ↓
+    return first usable enhanced articles
+        +
+    original search-engine snippets as fallbacks
 """
 
-import concurrent.futures
+from __future__ import annotations
+
 import html
+import http.server
 import ipaddress
 import json
 import logging
 import logging.handlers
-import os
 import re
 import socket
-import sys
 import threading
 import time
-import uuid
-import urllib.parse
-import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Any, Callable
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import httpx
 from camoufox.sync_api import Camoufox
-
-from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
+from sumy.parsers.plaintext import PlaintextParser
 from sumy.summarizers.lex_rank import LexRankSummarizer
 
-# ============================================================
-# CONFIG
-# ============================================================
+
+# ============================================================================
+# Configuration
+# ============================================================================
 
 HOST = "0.0.0.0"
 PORT = 8787
 
-DEFAULT_LIMIT = 10
+DEFAULT_LIMIT = 3
 MAX_LIMIT = 20
+MAX_CANDIDATES = 10
 
-MAX_CANDIDATES = 5
-TARGET_USABLE_ARTICLES = 2  # Enforced limit for summaries
-
-# Timeouts
-SEARCH_TIMEOUT = 10000      # Milliseconds for browser search
-HTTP_TIMEOUT = 10.0        # Seconds for HTTP fetch (slightly longer for streaming)
-BROWSER_TIMEOUT = 10000     # Millieconds for Camoufox fetch
+SEARCH_TIMEOUT = 10000      # milliseconds for Playwright
+HTTP_TIMEOUT = 10.0
+BROWSER_TIMEOUT = 10000     # milliseconds for Playwright
 BROWSER_SETTLE_MS = 250
 
-# Content Limits
 MIN_ARTICLE_CHARS = 500
-MAX_SUMMARY_CHARS = 32768  # Max length of the final summary string
-MAX_CONTENT_BYTES = 2 * 1024 * 1024  # 2MB hard cap for network responses
-MAX_ARTICLE_TEXT_BYTES = 10 * 1024 * 1024  # 10MB cap for extracted text before summarization
-SUMMARY_SENTENCES = 3  # Fix: defined here to prevent NameError
+MAX_SUMMARY_CHARS = 32768
+MAX_CONTENT_BYTES = 2 * 1024 * 1024
+MAX_ARTICLE_TEXT_BYTES = 10 * 1024 * 1024
 
-# Redirect Limit
+SUMMARY_SENTENCES = 3
 MAX_REDIRECTS = 10
 
-# Script Directory for absolute path resolution
 SCRIPT_DIR = Path(__file__).resolve().parent
 READABILITY_JS_PATH = SCRIPT_DIR / "lib" / "Readability.js"
 
+# Change this for another installation.
 LOG_DIR = "/home/david/AI/camoufox/logs"
+
 LOG_MAX_BYTES = 10 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
 
-VERSION = "3.5"
+VERSION = "4.0"
 
-# SSRF Policy: Blocks
-BLOCKED_SUBNETS = [
-    ipaddress.ip_network("10.0.0.0/8"),       # Private
-    ipaddress.ip_network("172.16.0.0/12"),     # Private
-    ipaddress.ip_network("192.168.0.0/16"),    # Private
-    ipaddress.ip_network("127.0.0.0/8"),       # Loopback
-    ipaddress.ip_network("169.254.0.0/16"),    # Link-local
-    ipaddress.ip_network("100.64.0.0/10"),     # CGNAT
-    ipaddress.ip_network("0.0.0.0/8"),         # Current network
-    ipaddress.ip_network("192.0.0.0/24"),      # IETF Reserved
-    ipaddress.ip_network("192.0.2.0/24"),      # TEST-NET-1
-    ipaddress.ip_network("198.51.100.0/24"),   # TEST-NET-2
-    ipaddress.ip_network("203.0.113.0/24"),    # TEST-NET-3
-    ipaddress.ip_network("198.18.0.0/15"),     # Benchmarking
-]
+# v3.x used this as a latency guard. Two genuinely usable articles are
+# normally enough for an LLM retrieval call. If you want the service to
+# exhaustively try all requested results, set this equal to MAX_LIMIT.
+TARGET_USABLE_ARTICLES = 2
 
-# IPv6 Private/Unique-Local
-BLOCKED_IPV6_SUBNETS = [
-    ipaddress.ip_network("fc00::/7"),          # Unique Local
-    ipaddress.ip_network("fe80::/10"),         # Link-Local
-    ipaddress.ip_network("::1/128"),           # Loopback
-    ipaddress.ip_network("::ffff:0:0/96"),     # IPv4-mapped (loopback/private)
-]
-# Add multicast and reserved IPv6
-BLOCKED_IPV6_SUBNETS.append(ipaddress.ip_network("ff00::/8"))  # Multicast
-BLOCKED_IPV6_SUBNETS.append(ipaddress.ip_network("2000::/3"))  # Global Unicast is allowed, but we block specific reserved blocks if needed. 
-# Actually, standard public IPv6 is allowed. We just block the private/reserved ones.
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0.0.0 Safari/537.36"
+)
 
-# ============================================================
-# LOGGING
-# ============================================================
+SEARCH_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-GB,en;q=0.9",
+}
 
-def setup_logging():
-    logger = logging.getLogger("search_service")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
+HTTP_HEADERS = {
+    **SEARCH_HEADERS,
+    "Cache-Control": "no-cache",
+}
 
-    if logger.handlers:
-        return logger
 
-    os.makedirs(LOG_DIR, exist_ok=True)
+# ============================================================================
+# Logging
+# ============================================================================
 
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+logger = logging.getLogger("search_service")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+
+log_path = (
+    Path(LOG_DIR)
+    / f"search_service_{time.strftime('%Y-%m-%d_%H%M%S')}.log"
+)
+
+log_handler = logging.handlers.RotatingFileHandler(
+    log_path,
+    maxBytes=LOG_MAX_BYTES,
+    backupCount=LOG_BACKUP_COUNT,
+    encoding="utf-8",
+)
+
+log_handler.setFormatter(
+    logging.Formatter(
+        "%(asctime)s %(levelname)s %(threadName)s %(message)s"
     )
+)
 
-    timestamp = time.strftime("%Y-%m-%d_%H%M%S")
-    log_file = os.path.join(
-        LOG_DIR,
-        f"search_service_{timestamp}.log",
+logger.addHandler(log_handler)
+
+
+# ============================================================================
+# SSRF protection
+# ============================================================================
+
+# Explicitly blocked IPv4 ranges.
+#
+# ipaddress.is_global is also used below as the final gate, so this list is
+# intentionally defensive rather than exhaustive.
+
+BLOCKED_SUBNETS = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
     )
+)
 
-    logfile = logging.handlers.RotatingFileHandler(
-        log_file,
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8",
+# Explicitly blocked IPv6 ranges.
+
+BLOCKED_IPV6_SUBNETS = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "::/128",
+        "::1/128",
+        "::ffff:0:0/96",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+        "2001:db8::/32",
     )
-    logfile.setFormatter(formatter)
-    logger.addHandler(logfile)
-
-    return logger
+)
 
 
-log = setup_logging()
-
-# ============================================================
-# SSRF / NETWORK UTILS
-# ============================================================
-
-def _is_ip_private_or_reserved(ip_str: str) -> bool:
+def _is_ip_blocked(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
     """
-    Check if an IP address is in a blocked range (private, loopback, etc.).
+    Return True if an address is not safe for outbound retrieval.
+
+    Global IPv6 is deliberately allowed. In particular, do NOT add
+    2000::/3 to BLOCKED_IPV6_SUBNETS.
     """
+
+    if address.version == 4:
+        if any(address in subnet for subnet in BLOCKED_SUBNETS):
+            return True
+    else:
+        if any(address in subnet for subnet in BLOCKED_IPV6_SUBNETS):
+            return True
+
+    # This catches private/reserved/unspecified/etc. ranges not explicitly
+    # enumerated above.
+    return not address.is_global
+
+
+def _resolve_host(
+    hostname: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve A/AAAA records and return unique parsed addresses."""
+
+    addresses = []
+    seen: set[str] = set()
+
     try:
-        addr = ipaddress.ip_address(ip_str)
-    except ValueError:
+        infos = socket.getaddrinfo(
+            hostname,
+            None,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except (socket.gaierror, OSError):
+        return []
+
+    for info in infos:
+        sockaddr = info[4]
+
+        if not sockaddr:
+            continue
+
+        try:
+            address = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+
+        key = str(address)
+
+        if key not in seen:
+            seen.add(key)
+            addresses.append(address)
+
+    return addresses
+
+
+def is_url_safe(url: str) -> bool:
+    """
+    Validate a URL before making a network request.
+
+    DNS failure is treated as unsafe.
+
+    If a hostname resolves to even one blocked/private/reserved address,
+    the hostname is rejected. This prevents simple DNS round-robin /
+    rebinding cases where one returned address is internal.
+    """
+
+    try:
+        parsed = urlparse(url)
+
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+
+        if scheme not in {"http", "https"}:
+            return False
+
+        if not hostname:
+            return False
+
+        # Userinfo is unnecessary for search retrieval and can leak secrets.
+        if parsed.username is not None or parsed.password is not None:
+            return False
+
+        try:
+            port = parsed.port
+        except ValueError:
+            return False
+
+        if port is not None and not 1 <= port <= 65535:
+            return False
+
+        # Literal IP.
+        try:
+            literal = ipaddress.ip_address(hostname)
+        except ValueError:
+            literal = None
+
+        if literal is not None:
+            return not _is_ip_blocked(literal)
+
+        # Hostname.
+        resolved = _resolve_host(hostname)
+
+        # Fail closed on DNS failure.
+        if not resolved:
+            return False
+
+        # If any DNS answer is internal/private/reserved, reject the host.
+        return all(not _is_ip_blocked(address) for address in resolved)
+
+    except (ValueError, UnicodeError):
         return False
 
-    if addr.version == 4:
-        for subnet in BLOCKED_SUBNETS:
-            if addr in subnet:
+
+# ============================================================================
+# General helpers
+# ============================================================================
+
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    return re.sub(
+        r"\s+",
+        " ",
+        html.unescape(str(value)),
+    ).strip()
+
+
+def decode_ddg_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+
+        if parsed.path == "/l/" and parsed.query:
+            target = parse_qs(parsed.query).get("uddg")
+
+            if target:
+                return unquote(target[0])
+
+    except Exception:
+        pass
+
+    return url
+
+
+def canonical_url(url: str) -> str:
+    """
+    Canonicalise enough to deduplicate normal search-engine URL variants.
+
+    Query parameters are retained because they can be semantically important.
+    Fragments are discarded.
+    """
+
+    try:
+        parsed = urlparse(decode_ddg_url(url))
+
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+
+        if hostname.startswith("www."):
+            hostname = hostname[4:]
+
+        port = parsed.port
+
+        if port is not None and not (
+            (scheme == "http" and port == 80)
+            or (scheme == "https" and port == 443)
+        ):
+            netloc = f"{hostname}:{port}"
+        else:
+            netloc = hostname
+
+        path = parsed.path or "/"
+
+        if path != "/":
+            path = path.rstrip("/")
+
+        return parsed._replace(
+            scheme=scheme,
+            netloc=netloc,
+            path=path,
+            fragment="",
+        ).geturl()
+
+    except Exception:
+        return url
+
+
+def is_html_content(content_type: str) -> bool:
+    content_type = (content_type or "").lower()
+
+    return (
+        "text/html" in content_type
+        or "application/xhtml+xml" in content_type
+    )
+
+
+def is_probably_html(text: str) -> bool:
+    sample = text[:2000].lstrip().lower()
+
+    return (
+        "<!doctype html" in sample
+        or "<html" in sample
+        or "<head" in sample
+        or "<body" in sample
+    )
+
+
+# ============================================================================
+# Search-result filtering
+# ============================================================================
+
+DDG_AD_PATTERNS = (
+    "duckduckgo.com/y.js",
+    "ad_type=txad",
+    "ad_provider=",
+    "ad_domain=",
+)
+
+# Known high-level hub paths for sites where these are especially common.
+#
+# "/" means exact root only. It must NOT be treated as a prefix.
+KNOWN_HUB_RULES = {
+    "reuters.com": (
+        "/",
+        "/technology",
+        "/world",
+        "/business",
+        "/markets",
+        "/sports",
+        "/lifestyle",
+        "/politics",
+        "/topics",
+    ),
+    "techcrunch.com": (
+        "/",
+        "/category",
+        "/tag",
+        "/topics",
+    ),
+    "news.google.com": (
+        "/",
+        "/topics",
+        "/search",
+    ),
+}
+
+GENERIC_HUB_SEGMENTS = {
+    "search",
+    "tag",
+    "tags",
+    "category",
+    "categories",
+    "topic",
+    "topics",
+    "author",
+    "authors",
+    "archive",
+    "archives",
+    "feed",
+    "rss",
+}
+
+
+def is_ddg_ad(url: str) -> bool:
+    lowered = url.lower()
+
+    return any(
+        pattern in lowered
+        for pattern in DDG_AD_PATTERNS
+    )
+
+
+def _hub_path_matches(
+    path: str,
+    prefixes: tuple[str, ...],
+) -> bool:
+    for prefix in prefixes:
+
+        # Root is an exact match, never a prefix match.
+        if prefix == "/":
+            if path == "/":
                 return True
-    else:
-        for subnet in BLOCKED_IPV6_SUBNETS:
-            if addr in subnet:
-                return True
+
+            continue
+
+        prefix = prefix.rstrip("/")
+
+        if path == prefix:
+            return True
+
+        if path.startswith(prefix + "/"):
+            return True
 
     return False
 
 
-def resolve_host(host: str) -> List[str]:
+def is_obvious_hub(url: str) -> bool:
     """
-    Resolve hostname to IPv4 and IPv6 addresses.
-    Returns the list of public IPs.
-    If all resolved IPs are private/reserved, returns [].
-    Raises socket.gaierror on DNS failure.
+    Reject obvious section/search/tag/category pages.
+
+    This is deliberately conservative. The deeper article-quality checks
+    provide the second line of defence.
     """
+
     try:
-        addrs_v4 = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
-        addrs_v6 = socket.getaddrinfo(host, None, socket.AF_INET6, socket.SOCK_STREAM)
-        
-        public_ips = []
-        for info in addrs_v4 + addrs_v6:
-            ip = info[4][0]
-            if not _is_ip_private_or_reserved(ip):
-                public_ips.append(ip)
-        return public_ips
-    except socket.gaierror:
-        return []
+        parsed = urlparse(url)
 
+        host = (
+            parsed.hostname or ""
+        ).lower().removeprefix("www.")
 
-def is_url_safe(url_str: str) -> bool:
-    """
-    Check if the URL host is safe.
-    Rejects if any resolved A/AAAA record is private/reserved.
-    """
-    try:
-        parsed = urlparse(url_str)
-        host = parsed.hostname
+        path = parsed.path.rstrip("/") or "/"
 
-        if not host:
-            return False
+        for known_host, prefixes in KNOWN_HUB_RULES.items():
+            if host == known_host and _hub_path_matches(
+                path,
+                prefixes,
+            ):
+                return True
 
-        # If it's already an IP
-        if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
-            return not _is_ip_private_or_reserved(host)
-        
-        # Resolve ALL addresses
-  
-        try:
-            addrs_v4 = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
-        except socket.gaierror:
-            addrs_v4 = []
-        try:
-            addrs_v6 = socket.getaddrinfo(host, None, socket.AF_INET6, socket.SOCK_STREAM)
-        except socket.gaierror:
-            addrs_v6 = []        
-        
-        
-        
-        
-        
-        all_ips = []
-        for info in addrs_v4 + addrs_v6:
-            all_ips.append(info[4][0])
+        segments = [
+            part.lower()
+            for part in path.split("/")
+            if part
+        ]
 
-        # Reject if ANY IP is private/reserved
-        for ip in all_ips:
-            if _is_ip_private_or_reserved(ip):
-                return False
-        
-        return True
-    except Exception:
+        if segments and segments[0] in GENERIC_HUB_SEGMENTS:
+            return True
+
+        if path in {
+            "/search",
+            "/feed",
+            "/rss",
+            "/sitemap.xml",
+        }:
+            return True
+
         return False
 
+    except Exception:
+        # Malformed URLs should never become final candidates.
+        return True
 
-# ============================================================
-# CAMOUFOX BROWSER EXECUTOR
-# ============================================================
+
+def normalise_search_result(
+    url: str,
+    title: str,
+    snippet: str,
+) -> dict[str, Any] | None:
+    url = canonical_url(url)
+    title = clean_text(title)
+    snippet = clean_text(snippet)
+
+    if not url or not title:
+        return None
+
+    if not is_url_safe(url):
+        return None
+
+    if is_obvious_hub(url):
+        return None
+
+    return {
+        "url": url,
+        "title": title,
+        "snippet": snippet,
+    }
+
+
+# ============================================================================
+# Dedicated Camoufox owner thread
+# ============================================================================
 
 class BrowserExecutor:
     """
-    Owns Camoufox and all Playwright objects from one dedicated thread.
+    Owns Camoufox and every Playwright object from one dedicated thread.
+
+    Playwright objects are never passed between HTTP worker threads.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
+        self._tasks: list[
+            tuple[Callable[[Any], Any], Future[Any]]
+        ] = []
+
         self._condition = threading.Condition()
-        self._tasks: List[Tuple[callable, concurrent.futures.Future]] = []
         self._stopping = False
-        self._startup_error = None
-        self._ready = False
-        self._browser = None
+
+        self._ready = threading.Event()
+        self._startup_error: BaseException | None = None
 
         self._thread = threading.Thread(
             target=self._run,
             name="camoufox-owner",
             daemon=True,
         )
+
         self._thread.start()
 
-        # Wait for startup
-        with self._condition:
-            while not self._stopping and self._startup_error is None and not self._ready:
-                self._condition.wait(timeout=5.0)
-                if self._stopping and self._startup_error:
-                    break
+        self._ready.wait(timeout=60)
 
-        if self._startup_error:
-            raise RuntimeError(f"Camoufox failed during startup: {self._startup_error}")
-        if not self._ready:
-            raise RuntimeError("Camoufox browser executor stopped during startup")
+        if self._startup_error is not None:
+            raise RuntimeError(
+                f"Camoufox startup failed: {self._startup_error}"
+            )
 
-    def _run(self):
-        camoufox = None
-        browser = None
+        if not self._ready.is_set():
+            raise RuntimeError(
+                "Timed out waiting for Camoufox startup"
+            )
 
+    def _run(self) -> None:
         try:
-            log.info("[-] CAMOUFOX OWNER STARTING")
-            camoufox = Camoufox(headless=True, locale="en-GB")
-            browser = camoufox.__enter__()
-            self._browser = browser
+            with Camoufox(
+                headless=True,
+                locale="en-GB",
+            ) as browser:
 
-            with self._condition:
-                self._ready = True
-                self._condition.notify_all()
+                self._ready.set()
 
-            log.info("[-] CAMOUFOX READY")
+                while True:
+                    with self._condition:
 
-            while True:
-                with self._condition:
-                    while not self._tasks and not self._stopping:
-                        self._condition.wait(timeout=1.0)
-                    
-                    if self._stopping and not self._tasks:
-                        break
+                        while (
+                            not self._tasks
+                            and not self._stopping
+                        ):
+                            self._condition.wait()
 
-                    if self._tasks:
+                        if (
+                            self._stopping
+                            and not self._tasks
+                        ):
+                            return
+
                         task, future = self._tasks.pop(0)
-                    else:
+
+                    if future.cancelled():
                         continue
 
-                if future.cancelled():
-                    continue
+                    try:
+                        result = task(browser)
 
-                try:
-                    result = task(browser)
-                    if not future.cancelled():
-                        future.set_result(result)
-                except Exception as exc:
-                    if not future.cancelled():
-                        future.set_exception(exc)
+                    except BaseException as exc:
+                        if not future.cancelled():
+                            future.set_exception(exc)
 
-        except Exception as exc:
-            log.exception("[-] CAMOUFOX OWNER FAILED")
+                    else:
+                        if not future.cancelled():
+                            future.set_result(result)
+
+        except BaseException as exc:
+            self._startup_error = exc
+            self._ready.set()
+
             with self._condition:
-                self._startup_error = exc
-                self._stopping = True
                 pending = self._tasks
                 self._tasks = []
-                self._condition.notify_all()
+
             for _, future in pending:
-                if not future.done():
+                if not future.cancelled():
                     future.set_exception(exc)
 
-        finally:
-            if camoufox is not None:
-                try:
-                    camoufox.__exit__(None, None, None)
-                except Exception:
-                    log.exception("[-] CAMOUFOX SHUTDOWN FAILED")
-            
-            with self._condition:
-                self._stopping = True
-                self._ready = False
-                self._condition.notify_all()
-            log.info("[-] CAMOUFOX OWNER STOPPED")
+    def call(
+        self,
+        task: Callable[[Any], Any],
+        timeout: float = 30.0,
+    ) -> Any:
+        future: Future[Any] = Future()
 
-    def submit(self, task):
-        future = concurrent.futures.Future()
         with self._condition:
             if self._stopping:
-                future.set_exception(RuntimeError("Browser executor stopped"))
-                return future
-            if self._startup_error:
-                future.set_exception(RuntimeError("Browser executor failed"))
-                return future
-            if not self._thread.is_alive():
-                future.set_exception(RuntimeError("Browser owner thread dead"))
-                return future
+                raise RuntimeError(
+                    "Browser executor is stopping"
+                )
+
             self._tasks.append((task, future))
             self._condition.notify()
-        return future
 
-    def call(self, task):
-        future = self.submit(task)
-        try:
-            return future.result(timeout=30)
-        except Exception:
-            log.exception("[-] CAMOUFOX TASK FAILED")
-            raise
+        return future.result(timeout=timeout)
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         with self._condition:
             self._stopping = True
             self._condition.notify_all()
-        if self._thread.is_alive():
-            self._thread.join(timeout=10)
-        if self._thread.is_alive():
-            log.error("[-] CAMOUFOX OWNER DID NOT STOP CLEANLY")
+
+        self._thread.join(timeout=15)
 
 
-browser_executor = None
+browser_executor: BrowserExecutor | None = None
+
+# Prevent multiple simultaneous browser searches from fighting over the
+# dedicated Camoufox instance. HTTP article fetches remain concurrent.
 SEARCH_LOCK = threading.Lock()
 
-def start_browser_executor():
-    global browser_executor
+
+# ============================================================================
+# Search engines
+# ============================================================================
+
+def _search_ddg_on_browser(
+    browser: Any,
+    query: str,
+) -> list[dict[str, Any]]:
+
+    page = browser.new_page()
+
+    try:
+        url = (
+            "https://html.duckduckgo.com/html/?q="
+            + quote(query)
+        )
+
+        page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=SEARCH_TIMEOUT,
+        )
+
+        page.wait_for_timeout(BROWSER_SETTLE_MS)
+
+        rows = page.evaluate(
+            """
+            () => Array.from(
+                document.querySelectorAll(".result")
+            ).map(el => {
+                const a = el.querySelector("a.result__a");
+                const s = el.querySelector(".result__snippet");
+
+                return {
+                    url: a ? a.href : "",
+                    title: a ? a.textContent : "",
+                    snippet: s ? s.textContent : ""
+                };
+            })
+            """
+        )
+
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for row in rows:
+
+            raw_url = row.get("url", "")
+
+            if is_ddg_ad(raw_url):
+                continue
+
+            item = normalise_search_result(
+                decode_ddg_url(raw_url),
+                row.get("title", ""),
+                row.get("snippet", ""),
+            )
+
+            if not item:
+                continue
+
+            key = canonical_url(item["url"])
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            results.append(item)
+
+            if len(results) >= MAX_CANDIDATES:
+                break
+
+        return results
+
+    finally:
+        page.close()
+
+
+def _search_brave_on_browser(
+    browser: Any,
+    query: str,
+) -> list[dict[str, Any]]:
+
+    page = browser.new_page()
+
+    try:
+        url = (
+            "https://search.brave.com/search?q="
+            + quote(query)
+        )
+
+        page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=SEARCH_TIMEOUT,
+        )
+
+        page.wait_for_timeout(BROWSER_SETTLE_MS)
+
+        rows = page.evaluate(
+            """
+            () => {
+                const selectors = [
+                    ".snippet",
+                    "[data-type='search-result']",
+                    ".snippet-content"
+                ];
+
+                const nodes = [];
+                const seen = new Set();
+
+                for (const selector of selectors) {
+                    for (
+                        const el
+                        of document.querySelectorAll(selector)
+                    ) {
+                        if (!seen.has(el)) {
+                            seen.add(el);
+                            nodes.push(el);
+                        }
+                    }
+                }
+
+                return nodes.map(el => {
+                    const a =
+                        el.querySelector("a.result-header") ||
+                        el.querySelector("a[href]");
+
+                    const s =
+                        el.querySelector(
+                            ".snippet-description"
+                        ) ||
+                        el.querySelector(
+                            ".snippet-description-container"
+                        ) ||
+                        el.querySelector("[data-snippet]");
+
+                    return {
+                        url: a ? a.href : "",
+                        title: a ? a.textContent : "",
+                        snippet: s ? s.textContent : ""
+                    };
+                });
+            }
+            """
+        )
+
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for row in rows:
+
+            item = normalise_search_result(
+                row.get("url", ""),
+                row.get("title", ""),
+                row.get("snippet", ""),
+            )
+
+            if not item:
+                continue
+
+            key = canonical_url(item["url"])
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            results.append(item)
+
+            if len(results) >= MAX_CANDIDATES:
+                break
+
+        return results
+
+    finally:
+        page.close()
+
+
+def search(query: str) -> list[dict[str, Any]]:
     if browser_executor is None:
-        browser_executor = BrowserExecutor()
+        raise RuntimeError(
+            "Browser executor is not running"
+        )
 
-def shutdown_browser():
-    global browser_executor
-    if browser_executor is not None:
-        browser_executor.shutdown()
-        browser_executor = None
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    text = html.unescape(text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-def decode_ddg_url(href: str) -> str:
-    if not href:
-        return ""
-    try:
-        parsed = urlparse(href)
-        if parsed.path == "/l/":
-            params = parse_qs(parsed.query)
-            target = params.get("uddg")
-            if target:
-                return target[0]
-    except Exception:
-        pass
-    return href
-
-def canonical_url(url: str) -> str:
-    if not url:
-        return ""
-    try:
-        parsed = urlparse(url)
-        scheme = parsed.scheme.lower()
-        host = parsed.netloc.lower()
-        
-        if host.startswith("www."):
-            host = host[4:]
-        
-        path = parsed.path or "/"
-        if path != "/" and path.endswith("/"):
-            path = path.rstrip("/")
-
-        return parsed._replace(scheme=scheme, netloc=host, path=path, fragment="",).geturl()
-    except Exception:
-        return url
-
-def is_html_content(content_type: str) -> bool:
-    if not content_type:
-        return False
-    ct = content_type.lower()
-    return "text/html" in ct or "application/xhtml+xml" in ct
-
-# ============================================================
-# DDG AD FILTER
-# ============================================================
-
-def is_ddg_ad_result(url: str) -> bool:
-    if not url:
-        return False
-    url_lower = url.lower()
-    if "duckduckgo.com/y.js" in url_lower: return True
-    if "ad_type=txad" in url_lower: return True
-    if "ad_provider=" in url_lower: return True
-    if "ad_domain=" in url_lower: return True
-    return False
-
-def filter_ad_results(results: List[dict], request_id: str) -> List[dict]:
-    return [r for r in results if not is_ddg_ad_result(r.get("url", ""))]
-
-# ============================================================
-# HUB / TOPIC URL FILTERING
-# ============================================================
-
-def is_hub_url(url: str) -> bool:
-    if not url:
-        return True
-    try:
-        parsed = urlparse(canonical_url(url))
-        host = parsed.netloc.lower()
-        path = parsed.path.rstrip("/")
-
-        if host == "reuters.com":
-            if path in ("", "/technology", "/world", "/business", "/markets", "/sports", "/lifestyle", "/politics") or path.startswith("/topics/"):
-                return True
-        if host == "techcrunch.com":
-            if path == "" or path.startswith("/category/") or path.startswith("/tag/") or path.startswith("/topic/"):
-                return True
-        if host == "news.google.com":
-            if path == "" or path.startswith("/topics/") or path.startswith("/search"):
-                return True
-        return False
-    except Exception:
-        return False
-
-def filter_hub_results(results: List[dict], request_id: str) -> List[dict]:
-    for r in results:
-        r["_is_hub"] = is_hub_url(r.get("url", ""))
-    return results
-
-# ============================================================
-# SEARCH PIPELINE
-# ============================================================
-
-DDG_EXTRACT_JS = """
-() => {
-    const results = [];
-    document.querySelectorAll(".result").forEach(node => {
-        const titleNode = node.querySelector("a.result__a");
-        const snippetNode = node.querySelector(".result__snippet");
-        if (!titleNode) return;
-        const title = (titleNode.innerText || "").trim();
-        const href = titleNode.href || "";
-        const snippet = snippetNode ? (snippetNode.innerText || "").trim() : "";
-        if (title && href) {
-            results.push({ title, url: href, snippet });
-        }
-    });
-    return results;
-}
-"""
-
-def _search_ddg_on_browser(browser, query: str, request_id: str) -> List[dict]:
-    page = browser.new_page()
-    try:
-        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        page.goto(search_url, wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT)
-        page.wait_for_timeout(BROWSER_SETTLE_MS)
-        raw_results = page.evaluate(DDG_EXTRACT_JS)
-        
-        cleaned = []
-        for r in raw_results:
-            url = canonical_url(decode_ddg_url(r.get("url", "")))
-            # FIX: is_url_safe(url) because canonical_url() already returns a fully qualified URL.
-            # The previous code used is_url_safe(f"https://{url}") which resulted in 
-            # "https://https://example.com" for already-qualified URLs, causing rejection.
-            if url and is_url_safe(url):
-                cleaned.append({
-                    "title": clean_text(r.get("title", "")),
-                    "url": url,
-                    "snippet": clean_text(r.get("snippet", ""))
-                })
-        return cleaned
-    finally:
-        page.close()
-
-def search_ddg(query: str, request_id: str) -> List[dict]:
-    return browser_executor.call(lambda browser: _search_ddg_on_browser(browser, query, request_id))
-
-BRAVE_EXTRACT_JS = """
-() => {
-    const results = [];
-    document.querySelectorAll(".snippet").forEach(node => {
-        const titleNode = node.querySelector("a.result-header");
-        const snippetNode = node.querySelector(".snippet-description");
-        if (!titleNode) return;
-        const title = (titleNode.innerText || "").trim();
-        const href = titleNode.href || "";
-        const snippet = snippetNode ? (snippetNode.innerText || "").trim() or "";
-        if (title && href) {
-            results.push({ title, url: href, snippet });
-        }
-    });
-    return results;
-}
-"""
-
-def _search_brave_on_browser(browser, query: str, request_id: str) -> List[dict]:
-    page = browser.new_page()
-    try:
-        search_url = f"https://search.brave.com/search?q={quote_plus(query)}"
-        page.goto(search_url, wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT)
-        page.wait_for_timeout(BROWSER_SETTLE_MS)
-        raw_results = page.evaluate(BRAVE_EXTRACT_JS)
-        
-        cleaned = []
-        for r in raw_results:
-            url = canonical_url(r.get("url", ""))
-            if url:
-                cleaned.append({
-                    "title": clean_text(r.get("title", "")),
-                    "url": url,
-                    "snippet": clean_text(r.get("snippet", ""))
-                })
-        return cleaned
-    finally:
-        page.close()
-
-def search_brave(query: str, request_id: str) -> List[dict]:
-    return browser_executor.call(lambda browser: _search_brave_on_browser(browser, query, request_id))
-
-def deduplicate_results(results: List[dict]) -> List[dict]:
-    seen = set()
-    output = []
-    for r in results:
-        url = canonical_url(r.get("url", ""))
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        r["url"] = url
-        output.append(r)
-    return output
-
-def search(query: str, limit: int, request_id: str) -> List[dict]:
-    log.info("[%s] SEARCH query=%r limit=%d", request_id, query, limit)
-    
-    try:
-        results = search_ddg(query, request_id)
-        results = filter_ad_results(results, request_id)
-        results = deduplicate_results(results)
-        results = filter_hub_results(results, request_id)
-        if results:
-            log.info("[%s] DDG results=%d", request_id, len(results))
-            return results[:limit]
-    except Exception as e:
-        log.exception("[%s] DDG FAILED: %s", request_id, e)
+    logger.info(
+        "search start query=%r",
+        query,
+    )
 
     try:
-        results = search_brave(query, request_id)
-        results = deduplicate_results(results)
-        results = filter_hub_results(results, request_id)
-        if results:
-            log.info("[%s] BRAVE results=%d", request_id, len(results))
-            return results[:limit]
-    except Exception as e:
-        log.exception("[%s] BRAVE FAILED: %s", request_id, e)
+        ddg_results = browser_executor.call(
+            lambda browser: _search_ddg_on_browser(
+                browser,
+                query,
+            ),
+            timeout=30,
+        )
 
-    return []
+        logger.info(
+            "DDG returned %d candidates",
+            len(ddg_results),
+        )
 
-# ============================================================
-# READABILITY & EXTRACTION
-# ============================================================
+        for i, r in enumerate(ddg_results, 1):
+            logger.info(
+                "DDG #%d URL=%s SNIPPET=%r",
+                i,
+                r.get("url", ""),
+                (r.get("snippet", "") or "").replace("\\n", " ")[:500],
+            )
 
-def get_readability_source() -> Optional[str]:
-    """Load Readability.js relative to the script directory."""
+        if ddg_results:
+            return ddg_results
+
+    except Exception as exc:
+        logger.warning(
+            "DDG search failed: %s",
+            exc,
+        )
+
     try:
-        with open(READABILITY_JS_PATH, "r", encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        log.error("Readability.js not found at %s", READABILITY_JS_PATH)
-        return None
+        brave_results = browser_executor.call(
+            lambda browser: _search_brave_on_browser(
+                browser,
+                query,
+            ),
+            timeout=30,
+        )
 
-READABILITY_SOURCE = None
+        logger.info(
+            "Brave returned %d candidates",
+            len(brave_results),
+        )
+
+        for i, r in enumerate(brave_results, 1):
+            logger.info(
+                "Brave #%d URL=%s SNIPPET=%r",
+                i,
+                r.get("url", ""),
+                (r.get("snippet", "") or "").replace("\\n", " ")[:500],
+            )
+
+        return brave_results
+
+    except Exception as exc:
+        logger.warning(
+            "Brave search failed: %s",
+            exc,
+        )
+
+        return []
+
+
+# ============================================================================
+# Readability
+# ============================================================================
+
+READABILITY_SOURCE: str | None = None
 READABILITY_LOCK = threading.Lock()
 
-def extract_article(page) -> Optional[dict]:
+
+def get_readability_source() -> str:
+    global READABILITY_SOURCE
+
+    if READABILITY_SOURCE is None:
+        with READABILITY_LOCK:
+            if READABILITY_SOURCE is None:
+                READABILITY_SOURCE = (
+                    READABILITY_JS_PATH.read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+    return READABILITY_SOURCE
+
+
+def html_to_text(source: str) -> str:
+    source = re.sub(
+        r"<(script|style|noscript)\b[^>]*>.*?</\1>",
+        " ",
+        source,
+        flags=re.I | re.S,
+    )
+
+    source = re.sub(
+        r"<[^>]+>",
+        " ",
+        source,
+    )
+
+    return clean_text(source)
+
+
+class _LinkMetricsParser(HTMLParser):
+    """
+    Measure visible text and text contained inside links.
+
+    This is used after Readability extraction to identify pages which still
+    look like hubs rather than deep articles.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            convert_charrefs=True
+        )
+
+        self.text_chars = 0
+        self.link_text_chars = 0
+        self.link_count = 0
+        self._in_link = 0
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+
+        if tag.lower() == "a":
+            self.link_count += 1
+            self._in_link += 1
+
+    def handle_endtag(
+        self,
+        tag: str,
+    ) -> None:
+
+        if (
+            tag.lower() == "a"
+            and self._in_link
+        ):
+            self._in_link -= 1
+
+    def handle_data(
+        self,
+        data: str,
+    ) -> None:
+
+        n = len(clean_text(data))
+
+        if not n:
+            return
+
+        self.text_chars += n
+
+        if self._in_link:
+            self.link_text_chars += n
+
+
+def article_link_metrics(
+    content_html: str,
+) -> dict[str, float | int]:
+
+    parser = _LinkMetricsParser()
+
+    try:
+        parser.feed(content_html)
+        parser.close()
+    except Exception:
+        pass
+
+    text_chars = parser.text_chars
+    link_chars = parser.link_text_chars
+    links = parser.link_count
+
+    return {
+        "text_chars": text_chars,
+        "link_chars": link_chars,
+        "links": links,
+        "link_density": (
+            link_chars / max(text_chars, 1)
+        ),
+        "links_per_1000_chars": (
+            links * 1000 / max(text_chars, 1)
+        ),
+    }
+
+
+def article_quality(
+    article: dict[str, Any],
+) -> tuple[bool, str]:
+
+    if not article:
+        return False, "readability_empty"
+
+    if article.get("error"):
+        return False, "readability_error"
+
+    content_html = article.get("content") or ""
+
+    text = html_to_text(content_html)
+
+    if len(text) < MIN_ARTICLE_CHARS:
+        return False, "too_short"
+
+    if len(text.encode("utf-8")) > MAX_ARTICLE_TEXT_BYTES:
+        text = text[
+            : int(MAX_ARTICLE_TEXT_BYTES * 0.8)
+        ]
+
+    metrics = article_link_metrics(
+        content_html
+    )
+
+    links = int(metrics["links"])
+    density = float(
+        metrics["link_density"]
+    )
+    links_per_1000 = float(
+        metrics["links_per_1000_chars"]
+    )
+
+    # Conservative heuristics. These are deliberately not aggressive enough
+    # to reject ordinary articles simply because they contain links.
+    if links >= 20 and density > 0.25:
+        return False, "high_link_density"
+
+    if links >= 40 and links_per_1000 > 12:
+        return False, "hub_like_link_density"
+
+    if (
+        len(text) < 1200
+        and links >= 15
+        and density > 0.20
+    ):
+        return False, "short_link_heavy_page"
+
+    return True, "ok"
+
+
+def extract_article_on_page(
+    page: Any,
+) -> dict[str, Any] | None:
+
     source = get_readability_source()
-    if not source:
-        return None
-    
-    # We use a wrapper to eval the source in the page context
-    js_code = f"""
+
+    wrapper = f"""
     (() => {{
         try {{
-            eval({json.dumps(source)});
+            {source}
+
             const doc = document.cloneNode(true);
             const reader = new Readability(doc);
             const article = reader.parse();
+
             if (!article) return null;
+
             return {{
                 title: article.title || "",
                 content: article.content || "",
                 textContent: article.textContent || "",
-                excerpt: article.excerpt || ""
+                excerpt: article.excerpt || "",
+                length: article.length || 0
             }};
+
         }} catch (e) {{
-            return {{ error: String(e) }};
+            return {{
+                error: String(e)
+            }};
         }}
     }})()
     """
-    return page.evaluate(js_code)
 
-def html_to_text(source: str) -> str:
-    if not source:
-        return ""
-    source = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", source, flags=re.I|re.S)
-    source = re.sub(r"<(p|div|br|li|h[1-6]|section|article)[^>]*>", "\n", source, flags=re.I)
-    source = re.sub(r"</(p|div|li|h[1-6]|section|article)>", "\n", source, flags=re.I)
-    source = re.sub(r"<[^>]+>", " ", source)
-    source = html.unescape(source)
-    return clean_text(source)
-
-def article_quality(article: Optional[dict]) -> Tuple[bool, str, str]:
-    """
-    Returns (is_usable, text_content, reason_code)
-    """
-    if not article:
-        return False, "", "no_article"
-    if article.get("error"):
-        return False, "", "readability_error"
-    
-    text = html_to_text(article.get("content", ""))
-    text = clean_text(text)
-    
-    if not text:
-        return False, text, "empty_content"
-    if len(text) < MIN_ARTICLE_CHARS:
-        return False, text, f"too_short:{len(text)}"
-    
-    # Enforce extracted text cap
-    if len(text.encode('utf-8')) > MAX_ARTICLE_TEXT_BYTES:
-        # Truncate to cap
-        text = text[:int(MAX_ARTICLE_TEXT_BYTES * 0.8)] # Rough heuristic for UTF-8 safety
-        text += "..."
- 
-    return True, text, "ok"
-
-def summarize(text: str) -> str:
-    try:
-        parser = PlaintextParser.from_string(text, Tokenizer("english"))
-        summarizer = LexRankSummarizer()
-        sentences = summarizer(parser.document, SUMMARY_SENTENCES)
-        result = " ".join(str(s) for s in sentences)
-        # Cap the summary size
-        if len(result) > MAX_SUMMARY_CHARS:
-            return result[:MAX_SUMMARY_CHARS]
-        return result
-    except Exception:
-        return ""
-
-# ============================================================
-# HTTP RETRIEVAL (STRICT SSRF & STREAMING)
-# ============================================================
-
-def fetch_http(url: str, request_id: str, index: int) -> Tuple[Optional[str], str, Dict[str, Any]]:
-    """
-    Fetches URL via HTTP.
-    Returns (html_content, status_string, metadata).
-    metadata contains: final_url, status_code, content_type, bytes_read, reason.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-GB,en;q=0.9",
-    }
-
-    # 1. Initial SSRF Check
-    if not is_url_safe(url):
-        return None, "ssrf_initial", {"final_url": url, "reason": "ssrf_initial", "status_code": None, "content_type": None, "bytes_read": 0}
-
-    try:
-        with httpx.Client(follow_redirects=True, timeout=HTTP_TIMEOUT, headers=headers, max_redirects=MAX_REDIRECTS) as client:
-            # Use stream context manager for memory efficiency
-            with client.stream("GET", url) as response:
-                
-                final_url_str = str(response.url)
-                metadata = {
-                    "final_url": final_url_str,
-                    "status_code": response.status_code,
-                    "content_type": response.headers.get("content-type", ""),
-                    "bytes_read": 0,
-                    "reason": ""
-                }
-
-                # 2. Final SSRF Check (Redirect Target)
-                parsed_final = urlparse(final_url_str)
-                final_host = parsed_final.hostname
-                if final_host:
-                    if re.match(r"^\d+\.\d+\.\d+\.\d+$", final_host):
-                        if _is_ip_private_or_reserved(final_host):
-                            return None, "ssrf_redirect", metadata
-                    else:
-                        resolved = resolve_host(final_host)
-                        if not resolved: # Empty list means all IPs are private/reserved
-                            return None, "ssrf_redirect", metadata
-
-                if not is_html_content(metadata["content_type"]):
-                    return None, "not_html", metadata
-
-                # Check Content-Length header if present
-                cl_header = response.headers.get("content-length")
-                if cl_header:
-                    try:
-                        cl = int(cl_header)
-                        if cl > MAX_CONTENT_BYTES:
-                            return None, "content_too_large", metadata
-                    except ValueError:
-                        pass
-
-                # Stream the content
-                bytes_read = 0
-                content_buffer = []
-                try:
-                    for chunk in response.iter_bytes():
-                        bytes_read += len(chunk)
-                        metadata["bytes_read"] = bytes_read
-                        if bytes_read > MAX_CONTENT_BYTES:
-                            return None, "content_too_large", metadata
-                        content_buffer.append(chunk)
-                except httpx.StreamError:
-                    return None, "stream_error", metadata
-
-                try:
-                    html_content = b"".join(content_buffer).decode('utf-8', errors='replace')
-                except Exception as e:
-                    return None, "decode_error", metadata
-
-                if 200 <= response.status_code < 300:
-                    metadata["reason"] = "ok"
-                    return html_content, "ok", metadata
-                else:
-                    metadata["reason"] = f"http_error_{response.status_code}"
-                    return None, f"http_error_{response.status_code}", metadata
-
-    except httpx.RequestError as e:
-        return None, f"http_error_{type(e).__name__}", {"final_url": url, "reason": f"http_error_{type(e).__name__}", "status_code": None, "content_type": None, "bytes_read": 0}
-    except Exception as e:
-        return None, f"unexpected_error_{type(e).__name__}", {"final_url": url, "reason": f"unexpected_error_{type(e).__name__}", "status_code": None, "content_type": None, "bytes_read": 0}
+    return page.evaluate(wrapper)
 
 
-def _article_from_http_on_browser(browser, html_source: str, request_id: str, index: int) -> Optional[dict]:
-    page = browser.new_page()
-    try:
-        page.set_content(html_source, wait_until="domcontentloaded", timeout=5000)
-        return extract_article(page)
-    except Exception as e:
-        log.warning("[%s] READABILITY EXEC ERROR: %s", request_id, e)
-        return None
-    finally:
-        page.close()
+def extract_article_from_html(
+    html_source: str,
+) -> dict[str, Any] | None:
 
+    if browser_executor is None:
+        raise RuntimeError(
+            "Browser executor is not running"
+        )
 
-def article_from_http(html_source: str, request_id: str, index: int) -> Optional[dict]:
-    return browser_executor.call(lambda browser: _article_from_http_on_browser(browser, html_source, request_id, index))
+    def task(
+        browser: Any,
+    ) -> dict[str, Any] | None:
 
-# ============================================================
-# CAMOUFOX RETRIEVAL
-# ============================================================
-
-def _fetch_camoufox_on_browser(browser, url: str, request_id: str, index: int) -> Optional[dict]:
-    page = browser.new_page()
-    try:
-        # Validate initial URL
-        if not is_url_safe(url):
-            return None
-            
-        page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
-        page.wait_for_timeout(BROWSER_SETTLE_MS)
-        
-        # Note: Camoufox does not enforce SSRF on internal JS fetches.
-        # This is a known limitation. The initial navigation is checked.
-        # If the page redirects to a private IP via JS, it's not caught here.
-        
-        return extract_article(page)
-    except Exception as e:
-        log.info("[%s] CAMOUFOX ERROR: %s", request_id, e)
-        return None
-    finally:
-        page.close()
-
-
-def fetch_camoufox(url: str, request_id: str, index: int) -> Optional[dict]:
-    return browser_executor.call(lambda browser: _fetch_camoufox_on_browser(browser, url, request_id, index))
-
-# ============================================================
-# ENHANCEMENT LOGIC
-# ============================================================
-
-def build_summary_result(result: dict, text: str, request_id: str, index: int, fetch_method: str, start_time: float, metadata: Dict) -> dict:
-    summary = summarize(text)
-    total_time = time.perf_counter() - start_time
-    
-    return {
-        **result,
-        "content": summary,
-        "content_source": "article_summary",
-        "fetch_method": fetch_method,
-        "extract_time": total_time,
-        "metadata": {
-            "final_url": metadata.get("final_url", ""),
-            "status_code": metadata.get("status_code"),
-            "content_type": metadata.get("content_type"),
-            "bytes_read": metadata.get("bytes_read"),
-            "reason": metadata.get("reason")
-        }
-    }
-
-
-def enhance_result(result: dict, index: int, request_id: str) -> dict:
-    url = result.get("url", "")
-    snippet = result.get("snippet", "")
-    start = time.perf_counter()
-
-    # 1. HTTP Fetch
-    html_source, http_reason, http_metadata = fetch_http(url, request_id, index)
-    
-    if html_source:
-        article = article_from_http(html_source, request_id, index)
-        usable, text, reason = article_quality(article)
-        
-        if usable:
-            return build_summary_result(result, text, request_id, index, "http", start, http_metadata)
-        else:
-            log.info("[%s] HTTP rejected: %s", request_id, reason)
-
-    # 2. Camoufox Fallback
-    article = fetch_camoufox(url, request_id, index)
-    if article:
-        usable, text, reason = article_quality(article)
-        if usable:
-            camoufox_metadata = {
-                "final_url": url,
-                "status_code": "browser",
-                "content_type": "text/html",
-                "bytes_read": 0,
-                "reason": "ok"
-            }
-            return build_summary_result(result, text, request_id, index, "camoufox", start, camoufox_metadata)
-
-    # Failure
-    return {
-        **result,
-        "content": snippet,
-        "content_source": "search_snippet",
-        "fetch_method": "none",
-        "extract_reason": reason if article else http_reason,
-        "metadata": http_metadata
-    }
-
-# ============================================================
-# HUB LINK EXTRACTION
-# ============================================================
-
-HUB_LINK_EXTRACT_JS = """
-() => {
-    const links = [];
-    document.querySelectorAll("a[href]").forEach(node => {
-        const href = node.href || "";
-        const title = (node.innerText || node.textContent || "").trim();
-        if (href && title) links.push({ title, url: href });
-    });
-    return links;
-}
-"""
-
-def _filter_hub_links(links: list, hub_url: str) -> List[dict]:
-    if not links:
-        return []
-    try:
-        hub = urlparse(canonical_url(hub_url))
-        hub_host = hub.netloc.lower()
-    except Exception:
-        return []
-
-    output = []
-    seen = set()
-
-    for link in links:
-        if not isinstance(link, dict): continue
-        title = str(link.get("title", "")).strip()
-        url = str(link.get("url", "")).strip()
-        if not title or not url: continue
-        
-        try:
-            parsed = urlparse(canonical_url(url))
-        except Exception:
-            continue
-
-        if parsed.scheme not in ("http", "https"): continue
-        if hub_host and parsed.netloc.lower() != hub_host: continue
-        
-        canonical = canonical_url(url)
-        if not canonical or canonical in seen: continue
-        if is_hub_url(canonical): continue
-
-        path = parsed.path.lower()
-        if any(t in path for t in ("/author/", "/tag/", "/category/", "/feed", "/login")): continue
-        if re.search(r"\.(pdf|jpg|png)$", path): continue
-
-        seen.add(canonical)
-        output.append({"title": title, "url": canonical, "url_source": "page_link"})
-    
-    return output
-
-
-def _extract_hub_links_from_html(html_source: str, hub_url: str) -> List[dict]:
-    class LinkParser(HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self.links = []
-            self.current_href = None
-            self.current_text = []
-        def handle_starttag(self, tag, attrs):
-            if tag.lower() == "a":
-                attrs = dict(attrs)
-                self.current_href = attrs.get("href", "").strip()
-                self.current_text = []
-        def handle_data(self, data):
-            if self.current_href is not None:
-                self.current_text.append(data)
-        def handle_endtag(self, tag):
-            if tag.lower() == "a" and self.current_href:
-                title = " ".join("".join(self.current_text).split())
-                try:
-                    absolute = urljoin(canonical_url(hub_url), self.current_href)
-                except Exception:
-                    absolute = self.current_href
-                self.links.append({"title": title, "url": absolute})
-                self.current_href = None
-
-    parser = LinkParser()
-    try:
-        parser.feed(html_source)
-    except Exception:
-        return []
-    return _filter_hub_links(parser.links, hub_url)
-
-
-def _extract_hub_links_on_browser(url: str, request_id: str, index: int) -> List[dict]:
-    def task(browser):
         page = browser.new_page()
+
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=10)
-            page.wait_for_timeout(BROWSER_SETTLE_MS)
-            raw_links = page.evaluate(HUB_LINK_EXTRACT_JS)
-            return _filter_hub_links(raw_links, url)
+            page.set_content(
+                html_source,
+                wait_until="domcontentloaded",
+                # BROWSER_TIMEOUT is already expressed in milliseconds
+                # (see the config block above) -- Playwright's `timeout`
+                # kwarg also expects milliseconds, so it must be passed
+                # through unscaled. Multiplying by 1000 here previously
+                # turned a 10-second budget into ~10,000 seconds.
+                timeout=BROWSER_TIMEOUT,
+            )
+
+            return extract_article_on_page(page)
+
         finally:
             page.close()
+
+    return browser_executor.call(
+        task,
+        timeout=30,
+    )
+
+
+# ============================================================================
+# Summarisation
+# ============================================================================
+
+def summarize(text: str) -> str:
+    text = clean_text(text)
+
+    if not text:
+        return ""
+
     try:
-        return browser_executor.call(task)
-    except Exception as e:
-        log.warning("[%s] HUB BROWSER ERROR: %s", request_id, e)
-        return []
+        parser = PlaintextParser.from_string(
+            text,
+            Tokenizer("english"),
+        )
+
+        summarizer = LexRankSummarizer()
+
+        sentences = summarizer(
+            parser.document,
+            SUMMARY_SENTENCES,
+        )
+
+        result = clean_text(
+            " ".join(
+                str(sentence)
+                for sentence in sentences
+            )
+        )
+
+        if result:
+            return result[:MAX_SUMMARY_CHARS]
+
+    except Exception as exc:
+        logger.warning(
+            "LexRank failed: %s",
+            exc,
+        )
+
+    # Never return an empty result merely because the summariser failed.
+    return text[
+        : min(
+            MAX_SUMMARY_CHARS,
+            2000,
+        )
+    ]
 
 
-def extract_hub_links(result: dict, request_id: str, index: int) -> List[dict]:
-    url = result.get("url", "")
-    if not url: return []
+# ============================================================================
+# HTTP fetch
+# ============================================================================
 
-    html_source, _, _ = fetch_http(url, request_id, index)
-    
-    if html_source:
-        links = _extract_hub_links_from_html(html_source, url)
-        if links:
-            return links
+def fetch_http(
+    url: str,
+) -> dict[str, Any]:
 
-    return _extract_hub_links_on_browser(url, request_id, index)
+    start = time.perf_counter()
 
+    metadata = {
+        "final_url": url,
+        "status_code": 0,
+        "content_type": "",
+        "bytes_read": 0,
+        "reason": "",
+    }
 
-def enrich_hub_results(results: List[dict], request_id: str) -> List[dict]:
-    hubs = [(i, r) for i, r in enumerate(results, 1) if r.get("_is_hub")]
-    if not hubs: return results
+    current_url = canonical_url(url)
 
-    for index, result in hubs:
+    for hop in range(
+        MAX_REDIRECTS + 1
+    ):
+
+        # Every hop is independently checked.
+        if not is_url_safe(current_url):
+            metadata["reason"] = "ssrf_blocked"
+
+            return {
+                "ok": False,
+                "html": "",
+                "metadata": metadata,
+                "elapsed": (
+                    time.perf_counter()
+                    - start
+                ),
+            }
+
         try:
-            links = extract_hub_links(result, request_id, index)
-            result["links"] = links
-        except Exception as e:
-            log.exception("[%s] HUB ERROR: %s", request_id, e)
-            result["links"] = []
-    return results
+            with httpx.Client(
+                follow_redirects=False,
+                timeout=HTTP_TIMEOUT,
+                headers=HTTP_HEADERS,
+                trust_env=False,
+            ) as client:
 
-# ============================================================
-# PARALLEL CANDIDATES
-# ============================================================
+                with client.stream(
+                    "GET",
+                    current_url,
+                ) as response:
 
-def enhance_candidates(results: List[dict], request_id: str, limit: int) -> List[dict]:
-    results = enrich_hub_results(results, request_id)
-    # Filter out hubs for candidate processing
-    candidates = [r for r in results if not r.get("_is_hub", False)][:MAX_CANDIDATES]
-    
-    if not candidates:
-        return results
+                    metadata["status_code"] = (
+                        response.status_code
+                    )
 
-    log.info("[%s] PROCESSING %d candidates", request_id, len(candidates))
+                    metadata["content_type"] = (
+                        response.headers.get(
+                            "content-type",
+                            "",
+                        )
+                    )
 
-    # Use a dictionary to store enhancements by index to preserve order later
-    enhancements = {}
-    usable_count = 0
-    start_time = time.perf_counter()
+                    metadata["final_url"] = (
+                        current_url
+                    )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(candidates))) as executor:
-        # Map future -> index (1-based index into candidates list)
-        future_to_idx = {
-            executor.submit(fetch_http, cand.get("url", ""), request_id, i): i
-            for i, cand in enumerate(candidates, 1)
+                    # --------------------------------------------------------
+                    # Redirect
+                    # --------------------------------------------------------
+
+                    if 300 <= response.status_code < 400:
+
+                        location = (
+                            response.headers.get(
+                                "location"
+                            )
+                        )
+
+                        if not location:
+                            metadata["reason"] = (
+                                "redirect_without_location"
+                            )
+
+                            return {
+                                "ok": False,
+                                "html": "",
+                                "metadata": metadata,
+                                "elapsed": (
+                                    time.perf_counter()
+                                    - start
+                                ),
+                            }
+
+                        if hop >= MAX_REDIRECTS:
+                            metadata["reason"] = (
+                                "too_many_redirects"
+                            )
+
+                            return {
+                                "ok": False,
+                                "html": "",
+                                "metadata": metadata,
+                                "elapsed": (
+                                    time.perf_counter()
+                                    - start
+                                ),
+                            }
+
+                        current_url = canonical_url(
+                            urljoin(
+                                current_url,
+                                location,
+                            )
+                        )
+
+                        # Loop back around. The new URL will be SSRF checked
+                        # before the next network request.
+                        continue
+
+                    # --------------------------------------------------------
+                    # HTTP status
+                    # --------------------------------------------------------
+
+                    if not (
+                        200
+                        <= response.status_code
+                        < 300
+                    ):
+                        metadata["reason"] = (
+                            f"http_status_"
+                            f"{response.status_code}"
+                        )
+
+                        return {
+                            "ok": False,
+                            "html": "",
+                            "metadata": metadata,
+                            "elapsed": (
+                                time.perf_counter()
+                                - start
+                            ),
+                        }
+
+                    # --------------------------------------------------------
+                    # Size
+                    # --------------------------------------------------------
+
+                    content_length = (
+                        response.headers.get(
+                            "content-length"
+                        )
+                    )
+
+                    if content_length:
+
+                        try:
+                            if (
+                                int(content_length)
+                                > MAX_CONTENT_BYTES
+                            ):
+                                metadata["reason"] = (
+                                    "content_too_large"
+                                )
+
+                                return {
+                                    "ok": False,
+                                    "html": "",
+                                    "metadata": metadata,
+                                    "elapsed": (
+                                        time.perf_counter()
+                                        - start
+                                    ),
+                                }
+
+                        except ValueError:
+                            pass
+
+                    chunks: list[bytes] = []
+                    total = 0
+
+                    for chunk in response.iter_bytes():
+
+                        total += len(chunk)
+
+                        if (
+                            total
+                            > MAX_CONTENT_BYTES
+                        ):
+                            metadata["bytes_read"] = total
+                            metadata["reason"] = (
+                                "content_too_large"
+                            )
+
+                            return {
+                                "ok": False,
+                                "html": "",
+                                "metadata": metadata,
+                                "elapsed": (
+                                    time.perf_counter()
+                                    - start
+                                ),
+                            }
+
+                        chunks.append(chunk)
+
+                    body = b"".join(chunks)
+
+                    metadata["bytes_read"] = len(body)
+
+                    text = body.decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+
+                    # Some badly behaved sites omit Content-Type. Allow them
+                    # only if the body actually looks like HTML.
+                    if not is_html_content(
+                        metadata["content_type"]
+                    ):
+                        if not (
+                            not metadata["content_type"]
+                            and is_probably_html(text)
+                        ):
+                            metadata["reason"] = (
+                                "not_html"
+                            )
+
+                            return {
+                                "ok": False,
+                                "html": "",
+                                "metadata": metadata,
+                                "elapsed": (
+                                    time.perf_counter()
+                                    - start
+                                ),
+                            }
+
+                    metadata["reason"] = "ok"
+
+                    return {
+                        "ok": True,
+                        "html": text,
+                        "metadata": metadata,
+                        "elapsed": (
+                            time.perf_counter()
+                            - start
+                        ),
+                    }
+
+        except httpx.TimeoutException:
+            metadata["reason"] = "http_timeout"
+
+        except httpx.HTTPError as exc:
+            metadata["reason"] = (
+                "http_error:"
+                f"{type(exc).__name__}"
+            )
+
+        except Exception as exc:
+            metadata["reason"] = (
+                "fetch_error:"
+                f"{type(exc).__name__}"
+            )
+
+        # Network failures do not make the same URL safer on retry. Return
+        # here and let the caller move to Camoufox.
+        return {
+            "ok": False,
+            "html": "",
+            "metadata": metadata,
+            "elapsed": (
+                time.perf_counter()
+                - start
+            ),
         }
 
-        # Process results as they complete
-        for future in concurrent.futures.as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            result = candidates[idx-1]
+    metadata["reason"] = "redirect_loop"
 
-            # OPTIMIZATION: If we already have enough usable articles, skip processing others
-            if usable_count >= TARGET_USABLE_ARTICLES:
-                log.info("[%s] TARGET REACHED (%d), skipping candidate %d", request_id, usable_count, idx)
-                continue
+    return {
+        "ok": False,
+        "html": "",
+        "metadata": metadata,
+        "elapsed": (
+            time.perf_counter()
+            - start
+        ),
+    }
+
+
+# ============================================================================
+# Camoufox fallback
+# ============================================================================
+
+def _browser_request_is_safe(
+    request_url: str,
+) -> bool:
+
+    try:
+        scheme = urlparse(
+            request_url
+        ).scheme.lower()
+
+        if scheme in {"http", "https"}:
+            return is_url_safe(
+                request_url
+            )
+
+        if scheme in {"ws", "wss"}:
+            translated = (
+                request_url
+                .replace(
+                    "ws://",
+                    "http://",
+                    1,
+                )
+                .replace(
+                    "wss://",
+                    "https://",
+                    1,
+                )
+            )
+
+            return is_url_safe(
+                translated
+            )
+
+        # Browser local-resource protocols are not allowed.
+        if scheme in {"file", "ftp"}:
+            return False
+
+        # data:, blob:, about:, etc. do not directly make an arbitrary
+        # external network request.
+        return True
+
+    except Exception:
+        return False
+
+
+def fetch_browser(
+    url: str,
+) -> dict[str, Any]:
+
+    start = time.perf_counter()
+
+    metadata = {
+        "final_url": url,
+        "status_code": 0,
+        "content_type": "",
+        "bytes_read": 0,
+        "reason": "",
+    }
+
+    if not is_url_safe(url):
+        metadata["reason"] = "ssrf_blocked"
+
+        return {
+            "ok": False,
+            "article": None,
+            "metadata": metadata,
+            "elapsed": (
+                time.perf_counter()
+                - start
+            ),
+        }
+
+    if browser_executor is None:
+        metadata["reason"] = (
+            "browser_unavailable"
+        )
+
+        return {
+            "ok": False,
+            "article": None,
+            "metadata": metadata,
+            "elapsed": (
+                time.perf_counter()
+                - start
+            ),
+        }
+
+    def task(
+        browser: Any,
+    ) -> dict[str, Any]:
+
+        page = browser.new_page()
+
+        def route_handler(
+            route: Any,
+            request: Any,
+        ) -> None:
+
+            if _browser_request_is_safe(
+                request.url
+            ):
+                route.continue_()
+            else:
+                logger.warning(
+                    "Camoufox blocked unsafe request: %s",
+                    request.url,
+                )
+
+                route.abort(
+                    "blockedbyclient"
+                )
+
+        # This catches navigation redirects and requests initiated by
+        # page JavaScript.
+        page.route(
+            "**/*",
+            route_handler,
+        )
+
+        try:
+            response = page.goto(
+                url,
+                wait_until="domcontentloaded",
+                # BROWSER_TIMEOUT is already in milliseconds; see the
+                # matching note in extract_article_from_html above.
+                timeout=BROWSER_TIMEOUT,
+            )
+
+            page.wait_for_timeout(
+                BROWSER_SETTLE_MS
+            )
+
+            final_url = page.url or url
+
+            # Defence in depth: explicitly check the final browser URL too.
+            if not is_url_safe(final_url):
+                return {
+                    "ok": False,
+                    "article": None,
+                    "metadata": {
+                        **metadata,
+                        "final_url": final_url,
+                        "reason": (
+                            "ssrf_blocked_final_url"
+                        ),
+                    },
+                }
+
+            status_code = 0
+            content_type = ""
+
+            if response is not None:
+                try:
+                    status_code = response.status
+
+                    content_type = (
+                        response.headers.get(
+                            "content-type",
+                            "",
+                        )
+                    )
+
+                    content_length = (
+                        response.headers.get(
+                            "content-length"
+                        )
+                    )
+
+                    if content_length:
+                        try:
+                            metadata["bytes_read"] = (
+                                int(content_length)
+                            )
+                        except ValueError:
+                            pass
+
+                except Exception:
+                    pass
+
+            if (
+                content_type
+                and not is_html_content(
+                    content_type
+                )
+            ):
+                return {
+                    "ok": False,
+                    "article": None,
+                    "metadata": {
+                        **metadata,
+                        "final_url": final_url,
+                        "status_code": status_code,
+                        "content_type": content_type,
+                        "reason": "not_html",
+                    },
+                }
+
+            article = extract_article_on_page(
+                page
+            )
+
+            return {
+                "ok": True,
+                "article": article,
+                "metadata": {
+                    **metadata,
+                    "final_url": final_url,
+                    "status_code": status_code,
+                    "content_type": content_type,
+                    "reason": "ok",
+                },
+            }
+
+        finally:
+            page.close()
+
+    try:
+        result = browser_executor.call(
+            task,
+            timeout=30,
+        )
+
+        result["elapsed"] = (
+            time.perf_counter()
+            - start
+        )
+
+        return result
+
+    except Exception as exc:
+        metadata["reason"] = (
+            "browser_error:"
+            f"{type(exc).__name__}"
+        )
+
+        return {
+            "ok": False,
+            "article": None,
+            "metadata": metadata,
+            "elapsed": (
+                time.perf_counter()
+                - start
+            ),
+        }
+
+
+# ============================================================================
+# Candidate enhancement
+# ============================================================================
+
+def build_summary_result(
+    candidate: dict[str, Any],
+    article: dict[str, Any],
+    fetch_method: str,
+    metadata: dict[str, Any],
+    elapsed: float,
+) -> dict[str, Any]:
+
+    text = clean_text(
+        article.get(
+            "textContent",
+            "",
+        )
+    )
+
+    if not text:
+        text = html_to_text(
+            article.get(
+                "content",
+                "",
+            )
+        )
+
+    summary = summarize(text)
+
+    title = (
+        clean_text(
+            article.get(
+                "title"
+            )
+        )
+        or candidate["title"]
+    )
+
+    return {
+        # Preserve the original search-engine URL and snippet alongside
+        # the enhanced article result.
+        "url": candidate["url"],
+        "title": title,
+        "snippet": candidate.get("snippet", ""),
+
+        # README v4.0 field.
+        "summary": summary,
+
+        # v3.x/Calivi compatibility alias.
+        "content": summary,
+
+        "content_source": "article_summary",
+        "fetch_method": fetch_method,
+        "extract_time": round(
+            elapsed,
+            3,
+        ),
+
+        "metadata": {
+            "final_url": metadata.get(
+                "final_url",
+                candidate["url"],
+            ),
+            "status_code": metadata.get(
+                "status_code",
+                0,
+            ),
+            "content_type": metadata.get(
+                "content_type",
+                "",
+            ),
+            "bytes_read": metadata.get(
+                "bytes_read",
+                0,
+            ),
+            "reason": metadata.get(
+                "reason",
+                "ok",
+            ),
+        },
+    }
+
+
+def enhance_one(
+    candidate: dict[str, Any],
+) -> dict[str, Any] | None:
+
+    started = time.perf_counter()
+
+    # ------------------------------------------------------------
+    # Preferred path: HTTP
+    # ------------------------------------------------------------
+
+    http_result = fetch_http(
+        candidate["url"]
+    )
+
+    if http_result["ok"]:
+
+        try:
+            article = extract_article_from_html(
+                http_result["html"]
+            )
+
+            good, reason = article_quality(
+                article or {}
+            )
+
+            if good:
+                return build_summary_result(
+                    candidate,
+                    article or {},
+                    "http",
+                    http_result["metadata"],
+                    time.perf_counter()
+                    - started,
+                )
+
+            logger.info(
+                "HTTP article rejected "
+                "url=%s reason=%s",
+                candidate["url"],
+                reason,
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "HTTP extraction failed "
+                "url=%s error=%s",
+                candidate["url"],
+                exc,
+            )
+
+    # ------------------------------------------------------------
+    # Fallback: Camoufox
+    # ------------------------------------------------------------
+
+    browser_result = fetch_browser(
+        candidate["url"]
+    )
+
+    if browser_result["ok"]:
+
+        article = browser_result.get(
+            "article"
+        )
+
+        good, reason = article_quality(
+            article or {}
+        )
+
+        if good:
+            return build_summary_result(
+                candidate,
+                article or {},
+                "camoufox",
+                browser_result["metadata"],
+                time.perf_counter()
+                - started,
+            )
+
+        logger.info(
+            "Browser article rejected "
+            "url=%s reason=%s",
+            candidate["url"],
+            reason,
+        )
+
+    logger.info(
+        "candidate unusable "
+        "url=%s http_reason=%s "
+        "browser_reason=%s",
+        candidate["url"],
+        http_result["metadata"].get(
+            "reason"
+        ),
+        browser_result["metadata"].get(
+            "reason"
+        ),
+    )
+
+    return None
+
+
+RAW_FALLBACK_COUNT = 3
+ENHANCEMENT_WORKERS = 3
+
+
+def enhance_candidates(
+    candidates: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+
+    if not candidates or limit <= 0:
+        return []
+
+    candidates = candidates[
+        :MAX_CANDIDATES
+    ]
+
+    # Two successful article enhancements are the latency/quality target.
+    # Raw search results remain available independently of enhancement.
+    target = min(
+        limit,
+        TARGET_USABLE_ARTICLES,
+    )
+
+    # For normal LLM retrieval calls, return at most:
+    #   2 enhanced + 3 original search results
+    #
+    # A smaller API limit still acts as an upper bound.
+    output_limit = min(
+        limit,
+        TARGET_USABLE_ARTICLES + RAW_FALLBACK_COUNT,
+    )
+
+    enhanced: list[
+        tuple[int, dict[str, Any]]
+    ] = []
+
+    executor = ThreadPoolExecutor(
+        max_workers=min(
+            ENHANCEMENT_WORKERS,
+            len(candidates),
+        ),
+        thread_name_prefix="fetch",
+    )
+
+    # Keep only a small number of candidates in flight. This avoids
+    # launching ten potentially slow HTTP/Camoufox operations just to use
+    # the first two successful results.
+    next_index = 0
+    future_to_index: dict[
+        Future[Any],
+        int,
+    ] = {}
+
+    def submit_next() -> bool:
+        nonlocal next_index
+
+        if next_index >= len(candidates):
+            return False
+
+        index = next_index
+        next_index += 1
+
+        future = executor.submit(
+            enhance_one,
+            candidates[index],
+        )
+
+        future_to_index[future] = index
+        return True
+
+    try:
+        for _ in range(
+            min(
+                ENHANCEMENT_WORKERS,
+                len(candidates),
+            )
+        ):
+            submit_next()
+
+        while future_to_index:
+
+            # as_completed() yields whichever candidate finishes first.
+            # Therefore the first two suitable articles win on latency,
+            # rather than simply the first two search-engine candidates.
+            for future in as_completed(
+                list(future_to_index)
+            ):
+                index = future_to_index.pop(
+                    future
+                )
+
+                try:
+                    result = future.result()
+
+                except Exception as exc:
+                    logger.warning(
+                        "candidate worker failed "
+                        "index=%d error=%s",
+                        index,
+                        exc,
+                    )
+
+                    result = None
+
+                if result is not None:
+                    enhanced.append(
+                        (index, result)
+                    )
+
+                    logger.info(
+                        "candidate usable "
+                        "index=%d enhanced=%d/%d",
+                        index,
+                        len(enhanced),
+                        target,
+                    )
+
+                    if len(enhanced) >= target:
+                        break
+
+                # A failed/unsuitable candidate does not disappear from the
+                # raw fallback pool. Only successfully enhanced candidates
+                # are excluded from that pool.
+
+                if len(enhanced) < target:
+                    submit_next()
+
+            if len(enhanced) >= target:
+                break
+
+    finally:
+        # Futures that have not started can be cancelled. Futures already
+        # running may finish in the background, but they are no longer part
+        # of the request's result path.
+        executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+
+    # Enhanced results are deliberately ordered by completion time:
+    # whichever suitable articles became usable first are returned first.
+    results = [
+        result
+        for _, result in enhanced[:target]
+    ]
+
+    enhanced_indices = {
+        index
+        for index, _ in enhanced[:target]
+    }
+
+    # Original search-engine results are an independent fallback layer.
+    # Failed enhancement attempts remain eligible here.
+    raw_remaining = [
+        candidate
+        for index, candidate
+        in enumerate(candidates)
+        if index not in enhanced_indices
+    ]
+
+    raw_slots = max(
+        0,
+        output_limit - len(results),
+    )
+
+    for candidate in raw_remaining[
+        : min(
+            RAW_FALLBACK_COUNT,
+            raw_slots,
+        )
+    ]:
+        results.append(
+            {
+                "url": candidate["url"],
+                "title": candidate["title"],
+                "snippet": candidate.get(
+                    "snippet",
+                    "",
+                ),
+                "content_source": "search_snippet",
+            }
+        )
+
+    return results
+
+
+# ============================================================================
+# HTTP API
+# ============================================================================
+
+class SearchHandler(
+    http.server.BaseHTTPRequestHandler
+):
+    server_version = (
+        "search_service/4.0"
+    )
+
+    def log_message(
+        self,
+        fmt: str,
+        *args: Any,
+    ) -> None:
+
+        logger.info(
+            "%s - %s",
+            self.address_string(),
+            fmt % args,
+        )
+
+    def _send_json(
+        self,
+        payload: dict[str, Any],
+        status: int = 200,
+    ) -> None:
+
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        self.send_response(status)
+
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+
+        self.end_headers()
+
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        try:
+            parsed = urlparse(
+                self.path
+            )
+
+            # --------------------------------------------------------
+            # Health
+            # --------------------------------------------------------
+
+            if parsed.path == "/health":
+                self._send_json(
+                    {
+                        "status": "ok",
+                        "version": VERSION,
+                    }
+                )
+
+                return
+
+            # --------------------------------------------------------
+            # Search
+            # --------------------------------------------------------
+
+            if parsed.path != "/search":
+                self._send_json(
+                    {
+                        "error": "not_found"
+                    },
+                    status=404,
+                )
+
+                return
+
+            params = parse_qs(
+                parsed.query
+            )
+
+            query = clean_text(
+                params.get(
+                    "q",
+                    [""],
+                )[0]
+            )
+
+            if not query:
+                self._send_json(
+                    {
+                        "error": "missing_query"
+                    },
+                    status=400,
+                )
+
+                return
 
             try:
-                html_source, reason, metadata = future.result()
-            except Exception as e:
-                html_source = None
-                reason = f"worker_error_{type(e).__name__}"
-                metadata = {"reason": reason, "final_url": result.get("url"), "status_code": None, "content_type": None, "bytes_read": 0}
-
-            enhanced = None
-            
-            # Try HTTP Enhance
-            if html_source:
-                article = article_from_http(html_source, request_id, idx)
-                if article:
-                    usable, text, reason = article_quality(article)
-                    if usable:
-                        enhanced = build_summary_result(result, text, request_id, idx, "http", time.perf_counter(), metadata)
-                        usable_count += 1
-
-            # FIX: Remove the usable_count gate so ALL candidates get Camoufox tried
-            if not enhanced:
-                article = fetch_camoufox(result.get("url", ""), request_id, idx)
-                if article:
-                    usable, text, reason = article_quality(article)
-                    if usable:
-                        camoufox_metadata = {
-                            "final_url": result.get("url"),
-                            "status_code": "browser",
-                            "content_type": "text/html",
-                            "bytes_read": 0,
-                            "reason": "ok"
-                        }
-                        enhanced = build_summary_result(result, text, request_id, idx, "camoufox", time.perf_counter(), camoufox_metadata)
-                        usable_count += 1
-
-            if enhanced:
-                enhancements[idx] = enhanced
-
-    # Reconstruct results in original order, preserving hubs
-    # Map candidate index (1-based) back to its position in the original results list
-    # We need to maintain the original order of results, with hubs in place.
-    
-    final_results = []
-    enhanced_count = 0
-    
-    # Create a lookup: candidate_index -> enhanced_result
-    enhancement_lookup = {}
-    for cand_idx, enhanced in enhancements.items():
-        enhancement_lookup[cand_idx] = enhanced
-
-    for r in results:
-        if r in candidates:
-            # Find the index of this candidate in the candidates list
-            cand_idx = candidates.index(r) + 1  # 1-based index
-            if cand_idx in enhancement_lookup and enhanced_count < TARGET_USABLE_ARTICLES:
-                final_results.append(enhancement_lookup[cand_idx])
-                enhanced_count += 1
-            else:
-                # Return original snippet if not enhanced or target reached
-                final_results.append(r)
-        else:
-            final_results.append(r)
-    
-    # Trim to limit if necessary (though usually results <= limit from search())
-    final_results = final_results[:limit]
-    
-    return final_results
-
-# ============================================================
-# HTTP SERVER
-# ============================================================
-
-class SearchHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
-
-    def send_json(self, status, data):
-        # Clean internal markers
-        def clean(obj):
-            if isinstance(obj, dict):
-                return {k: clean(v) for k, v in obj.items() if k != "_is_hub"}
-            if isinstance(obj, list):
-                return [clean(i) for i in obj]
-            return obj
-
-        data = clean(data)
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        
-        try:
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            log.info("Client disconnected")
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-
-        if parsed.path == "/health":
-            self.send_json(200, {"status": "ok", "version": VERSION})
-            return
-
-        if parsed.path != "/search":
-            self.send_json(404, {"error": "not found"})
-            return
-
-        params = parse_qs(parsed.query)
-        query = params.get("q", [""])[0].strip()
-        
-        try:
-            limit = int(params.get("limit", [DEFAULT_LIMIT])[0])
-        except ValueError:
-            limit = DEFAULT_LIMIT
-        limit = max(1, min(limit, MAX_LIMIT))
-
-        if not query:
-            self.send_json(400, {"error": "missing q"})
-            return
-
-        request_id = uuid.uuid4().hex[:8]
-        self.request_id = request_id
-        start = time.perf_counter()
-
-        try:
-            with SEARCH_LOCK:
-                results = search(query, limit, request_id)
-                enhanced = enhance_candidates(results, request_id, limit)
-            
-            total = time.perf_counter() - start
-            usable = sum(1 for r in enhanced if r.get("content_source") == "article_summary")
-            
-            log.info("[%s] DONE total=%.3fs usable=%d", request_id, total, usable)
-            
-            # LOG ALL RESULTS SENT BACK TO LLM - ALWAYS
-            for r in enhanced:
-                content_preview = (r.get("content", "") or "").strip()[:300].replace("\n", " ")
-                log.info(
-                    "[%s] RETURN: URL=%s TITLE=%s SOURCE=%s CONTENT=%s",
-                    request_id,
-                    r.get("url", "")[:80],
-                    r.get("title", "")[:120],
-                    r.get("content_source", "search_snippet"),
-                    content_preview[:300]
+                limit = int(
+                    params.get(
+                        "limit",
+                        [str(DEFAULT_LIMIT)],
+                    )[0]
                 )
-            
-            self.send_json(200, {"query": query, "results": enhanced})
 
-        except Exception as e:
-            log.exception("[%s] ERROR: %s", request_id, e)
-            self.send_json(500, {"error": str(e)})
+            except ValueError:
+                limit = DEFAULT_LIMIT
+
+            limit = max(
+                1,
+                min(
+                    limit,
+                    MAX_LIMIT,
+                ),
+            )
+
+            started = time.perf_counter()
+
+            # SEARCH_LOCK protects the dedicated Camoufox search browser.
+            # Article enhancement is independently concurrent and must not
+            # block the next search request.
+            with SEARCH_LOCK:
+                candidates = search(query)
+
+            results = enhance_candidates(
+                candidates,
+                limit,
+            )
+
+            for i, r in enumerate(results, 1):
+                logger.info(
+                    "FINAL #%d URL=%s TITLE=%r SNIPPET=%r CONTENT_SOURCE=%s",
+                    i,
+                    r.get("url", ""),
+                    r.get("title", ""),
+                    (r.get("snippet", "") or "").replace("\\n", " ")[:500],
+                    r.get("content_source", ""),
+                )
+
+            elapsed = (
+                time.perf_counter()
+                - started
+            )
+
+            logger.info(
+                "search done "
+                "query=%r candidates=%d "
+                "results=%d elapsed=%.3fs",
+                query,
+                len(candidates),
+                len(results),
+                elapsed,
+            )
+
+            self._send_json(
+                {
+                    "query": query,
+                    "results": results,
+                }
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "request failed"
+            )
+
+            self._send_json(
+                {
+                    "error": str(exc)
+                },
+                status=500,
+            )
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# ============================================================================
+# Main
+# ============================================================================
 
-def main():
-    start_browser_executor()
-    server = ThreadingHTTPServer((HOST, PORT), SearchHandler)
-    log.info("search_service v%s on %s:%d", VERSION, HOST, PORT)
+def main() -> None:
+    global browser_executor
+
+    logger.info(
+        "starting search_service "
+        "version=%s host=%s port=%d",
+        VERSION,
+        HOST,
+        PORT,
+    )
+
+    if not READABILITY_JS_PATH.exists():
+        raise FileNotFoundError(
+            "Readability.js not found: "
+            f"{READABILITY_JS_PATH}"
+        )
+
+    browser_executor = BrowserExecutor()
+
+    server = http.server.ThreadingHTTPServer(
+        (HOST, PORT),
+        SearchHandler,
+    )
+
+    logger.info(
+        "listening on %s:%d",
+        HOST,
+        PORT,
+    )
+
     try:
         server.serve_forever()
+
     except KeyboardInterrupt:
-        log.info("Shutting down")
+        logger.info(
+            "shutdown requested"
+        )
+
     finally:
         server.server_close()
-        shutdown_browser()
+
+        if browser_executor is not None:
+            browser_executor.shutdown()
+            browser_executor = None
+
+        logger.info(
+            "search_service stopped"
+        )
+
 
 if __name__ == "__main__":
     main()
