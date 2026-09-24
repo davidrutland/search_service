@@ -1,0 +1,7 @@
+# Direct runtime dependencies for search_service.py
+# Tested in the current service virtual environment.
+# Python 3.13
+camoufox==0.5.5
+httpx==0.28.1
+readability-lxml==0.9
+sumy==0.13.0
