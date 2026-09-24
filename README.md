@@ -1,438 +1,134 @@
 # Search Service
 
-A local web search and evidence-extraction service for Max and other local AI applications.
+A local web-search and evidence-retrieval service designed for integration with local AI assistants.
 
-The service provides:
-
-1. Web search through DuckDuckGo, with Brave as a fallback.
-2. Browser-backed search using a single shared Camoufox instance.
-3. HTTP retrieval of candidate result pages.
-4. Local Mozilla Readability extraction from retrieved HTML.
-5. Lightweight local/LLM-based enhancement of extracted article content.
-6. Safe fallback to the original search-engine snippet when page retrieval or enhancement fails.
-7. JSON HTTP endpoints suitable for integration with Max.
-
-The design deliberately separates **search** from **article retrieval**. Camoufox is used for search-engine access only; individual article pages are fetched directly over HTTP.
-
----
-
-## Design goals
-
-The service is designed for a local AI assistant where search results need to become useful evidence without allowing slow or failed pages to stall the entire request.
-
-The main goals are:
-
-* Keep normal searches fast.
-* Produce useful cleaned article content where possible.
-* Preserve search-engine evidence when page retrieval fails.
-* Avoid browser-resource contention.
-* Bound total request time.
-* Prevent unsafe server-side requests.
-* Degrade gracefully rather than failing an entire search because one result is unusable.
-* Keep the service independent of the frontend using it.
-
-A key design principle is:
-
-> **Enhancement is optional. Search results remain valid even when enhancement fails.**
-
----
-
-## Architecture
-
-```text
-                    ┌─────────────────────┐
-                    │       Client        │
-                    │   Max / curl / etc. │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │   search_service    │
-                    │     HTTP server     │
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │    Search engine     │
-                    │  DDG → Brave fallback│
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │      Camoufox       │
-                    │  single shared owner│
-                    └──────────┬──────────┘
-                               │
-                         search results
-                               │
-              ┌────────────────┴────────────────┐
-              │                                 │
-              ▼                                 ▼
-     search-engine snippet              candidate URL
-              │                                 │
-              │                                 ▼
-              │                         bounded HTTP fetch
-              │                                 │
-              │                                 ▼
-              │                         local Readability
-              │                                 │
-              │                                 ▼
-              │                            enhancement
-              │                                 │
-              └────────────────┬────────────────┘
-                               │
-                               ▼
-                         JSON response
-```
-
-### Important resource boundary
-
-There is **one Camoufox browser owner**.
-
-Camoufox is used for search-engine interaction because some search engines require browser automation.
-
-It is **not** used as a fallback for individual article pages.
-
-This prevents failed article requests from filling the browser queue and delaying subsequent searches.
-
----
+The service combines search-engine results with optional HTTP retrieval, Mozilla Readability extraction, and Sumy extractive summarisation. It exposes a simple HTTP API and is designed to provide useful evidence quickly without allowing slow browser work to block subsequent searches.
 
 ## Current version
 
-```text
-VERSION = 7.0-fast
-```
+**Version:** `7.0-fast`
 
-The current timing configuration is:
+**Python:** 3.13
 
-| Setting                      |    Value | Purpose                                         |
-| ---------------------------- | -------: | ----------------------------------------------- |
-| `REQUEST_DEADLINE`           |  `12.0s` | Maximum overall request budget                  |
-| `ENHANCE_BUDGET`             |   `7.0s` | Maximum time allocated to result enhancement    |
-| `HTTP_TIMEOUT`               |   `6.0s` | Per-page HTTP timeout                           |
-| `BROWSER_TIMEOUT`            |   `5.0s` | Browser-executor shutdown/task handling         |
-| `SEARCH_TIMEOUT_MS`          | `6500ms` | Search operation timeout                        |
-| `HTTP_WORKERS`               |      `3` | Parallel HTTP enhancement workers               |
-| `TARGET_USABLE_ARTICLES`     |      `2` | Target number of successfully enhanced articles |
-| `ENHANCE_GLOBAL_CONCURRENCY` |      `3` | Global enhancement concurrency                  |
+## What it does
 
-The exact values are deliberately conservative. The service is intended to return useful evidence quickly rather than attempting exhaustive retrieval.
+The service accepts a search query and returns search results containing:
 
----
+* search-engine title
+* URL
+* original search-engine snippet
+* optional retrieved article content
+* optional extractive summary
+* `content_source` metadata indicating where the returned evidence came from
 
-# Search
-
-Search requests are sent through the browser-backed search executor.
-
-The normal search sequence is:
+The normal enhancement path is:
 
 ```text
-DuckDuckGo
+Search query
     │
-    ├── success → use results
+    ▼
+Search engine
     │
-    └── failure
-          │
-          ▼
-        Brave
-          │
-          ├── success → use results
-          │
-          └── failure → search request fails
+    ▼
+Search candidates
+    │
+    ├──► original search-engine snippet
+    │
+    ▼
+HTTP retrieval
+    │
+    ▼
+Mozilla Readability
+    │
+    ▼
+Sumy extractive summarisation
+    │
+    ▼
+Summary appended to original snippet
 ```
+
+If HTTP retrieval or extraction cannot produce usable article content, the service **keeps the original search-engine snippet unchanged**.
+
+There is deliberately no article-level Camoufox fallback in the current version.
+
+Camoufox is reserved for search operations.
+
+## Architecture
+
+The service has two distinct retrieval mechanisms.
+
+### Search
+
+Search-engine queries can use the browser-backed Camoufox path when required.
+
+Camoufox is managed through a single browser executor because browser instances are relatively expensive and are treated as a scarce resource.
 
 Search jobs have priority over other browser work.
 
-The browser executor maintains a priority queue so that stale lower-priority work cannot unnecessarily delay a new search.
+### Article enhancement
 
-Because article-level browser fallback has been removed, the browser queue is effectively reserved for search operations.
+Search results can be enhanced by retrieving the result URL directly over HTTP.
 
----
+The enhancement path is:
 
-# Article enhancement
+1. Fetch the URL with `httpx`.
+2. Apply SSRF and response-size safety checks.
+3. Extract the main article content with `readability-lxml`.
+4. Reject unusably short/invalid extraction.
+5. Generate an extractive summary with Sumy.
+6. Append the summary to the original search-engine snippet.
 
-After search results are obtained, the service attempts to retrieve useful content from candidate URLs.
+This avoids sending successful HTTP retrievals through Camoufox.
 
-The current path is:
+### Failed enhancement
 
-```text
-candidate URL
-     │
-     ▼
-safe HTTP request
-     │
-     ▼
-HTML
-     │
-     ▼
-Mozilla Readability
-     │
-     ▼
-usable article text?
-     │
- ┌───┴────┐
- │        │
-yes       no
- │        │
- ▼        ▼
-enhance   retain original
- │        search snippet
- ▼
-response
-```
-
-Successful HTTP retrieval uses local `readability-lxml`.
-
-This is intentional: Readability extraction does not require launching a browser.
-
----
-
-# No article-level Camoufox fallback
-
-The service does **not** fall back to Camoufox when an individual article cannot be fetched over HTTP.
-
-For example:
+If an article cannot be retrieved or extracted successfully:
 
 ```text
-HTTP fetch fails
-      │
-      ▼
-keep search-engine snippet
+HTTP enhancement fails
+        │
+        ▼
+Original search-engine snippet retained
 ```
 
-It does **not** do:
+The service does **not** subsequently launch a browser fallback for that article.
+
+This is intentional. It prevents failed article retrievals from filling the single Camoufox queue and delaying subsequent searches.
+
+## Dependencies
+
+The current runtime dependencies are pinned in `requirements.txt`:
 
 ```text
-HTTP fetch fails
-      │
-      ▼
-launch browser
-      │
-      ▼
-fetch article
+camoufox==0.5.5
+httpx==0.28.1
+readability-lxml==0.9
+sumy==0.13.0
 ```
 
-This was removed because browser fallbacks caused slow or failed article requests to occupy the shared Camoufox executor.
+The service otherwise uses Python's standard library.
 
-The result was that otherwise fast searches could be delayed by stale article-fetch work.
+The dependency file describes the service's direct runtime dependencies rather than every transitive package installed into the virtual environment.
 
-The current behaviour prioritises predictable latency.
+## Installation
 
----
+Python 3.13 is the current tested interpreter.
 
-# Graceful degradation
-
-Search-engine snippets are treated as valid evidence.
-
-If article retrieval or enhancement fails, the service returns the original search result rather than discarding it.
-
-For example:
-
-```json
-{
-  "title": "Example article",
-  "url": "https://example.com/article",
-  "snippet": "The original search-engine snippet...",
-  "content_source": "search_snippet"
-}
-```
-
-When article retrieval succeeds:
-
-```json
-{
-  "title": "Example article",
-  "url": "https://example.com/article",
-  "snippet": "The original search-engine snippet...",
-  "content": "Cleaned article content...",
-  "content_source": "article_http"
-}
-```
-
-The original search snippet is retained when enhancement succeeds rather than being silently replaced.
-
----
-
-# Security
-
-HTTP retrieval is subject to SSRF protection.
-
-The service validates candidate URLs before making outbound requests and applies bounded retrieval behaviour, including:
-
-* URL validation
-* restricted schemes
-* protection against requests to unsafe/private destinations
-* bounded redirects
-* response-size limits
-* HTTP timeouts
-* content-type handling
-* article-length checks
-
-The service should therefore not be treated as a general unrestricted HTTP proxy.
-
----
-
-# Concurrency
-
-Article enhancement uses a bounded worker pool.
-
-Current configuration:
-
-```text
-HTTP_WORKERS = 3
-ENHANCE_GLOBAL_CONCURRENCY = 3
-```
-
-The service does not attempt to retrieve every search result simultaneously.
-
-Instead, it works toward:
-
-```text
-TARGET_USABLE_ARTICLES = 2
-```
-
-Once sufficient usable articles have been obtained, additional enhancement work is not required.
-
-This keeps the service focused on obtaining enough useful evidence rather than maximising the number of fetched pages.
-
----
-
-# Request deadline
-
-Every search request has an overall deadline:
-
-```text
-REQUEST_DEADLINE = 12 seconds
-```
-
-The handler establishes a deadline when the request starts.
-
-The enhancement phase is additionally bounded by:
-
-```text
-ENHANCE_BUDGET = 7 seconds
-```
-
-The effective enhancement deadline cannot exceed the overall request deadline.
-
-Conceptually:
-
-```text
-request start
-│
-├────────────── search ──────────────┐
-│                                    │
-│                         enhancement│
-│                         ≤ 7 seconds│
-│                                    │
-└────────────────────────────────────┘
-             ≤ 12 seconds
-```
-
-The deadline is a hard architectural constraint rather than an aspiration.
-
----
-
-# Response behaviour
-
-The service is designed to return partial results wherever possible.
-
-A typical result may contain:
-
-```text
-title
-url
-snippet
-content
-content_source
-```
-
-`content_source` identifies where the usable content came from.
-
-Current values include:
-
-### `search_snippet`
-
-The article could not be usefully retrieved or enhanced.
-
-The original search-engine snippet is returned unchanged.
-
-### `article_http`
-
-The candidate URL was retrieved over HTTP and successfully processed.
-
-The cleaned article content is available in addition to the search snippet.
-
----
-
-# Enhancement
-
-Enhancement is deliberately secondary to retrieval.
-
-The service does not require enhancement to succeed for a search result to remain useful.
-
-The intended hierarchy is:
-
-```text
-search result
-    │
-    ├── search snippet
-    │       ↓
-    │   always useful fallback
-    │
-    └── article retrieval
-            │
-            ├── success
-            │      ↓
-            │   richer evidence
-            │
-            └── failure
-                   ↓
-              keep snippet
-```
-
-This prevents a secondary processing failure from turning a valid search result into a missing result.
-
----
-
-# Logging
-
-The service logs to its configured log directory using a rotating log file.
-
-Important operational events include:
-
-* service startup
-* search requests
-* search-engine selection
-* search timing
-* candidate counts
-* HTTP retrieval failures
-* enhancement failures
-* browser executor activity
-* request failures
-* request timing
-
-The service should be diagnosed from its logs rather than assuming that a slow request indicates a search-engine failure.
-
-In particular, a slow request should be examined for:
-
-```text
-search latency
-HTTP retrieval latency
-enhancement latency
-browser queue activity
-```
-
----
-
-# Running the service
-
-The service is a standalone Python application.
-
-Example:
+From the service directory:
 
 ```bash
-/home/david/AI/camoufox/venv/bin/python \
-    /home/david/AI/camoufox/search_service.py
+python3.13 -m venv venv
+venv/bin/python -m pip install -r requirements.txt
+```
+
+Camoufox may require its browser components to be installed/configured according to the Camoufox installation requirements for the installed version.
+
+## Running the service
+
+From the service directory:
+
+```bash
+venv/bin/python search_service.py
 ```
 
 The default service configuration listens on:
@@ -441,190 +137,303 @@ The default service configuration listens on:
 0.0.0.0:8787
 ```
 
-For local clients, use:
+For local use, clients can normally access it through:
 
 ```text
 http://127.0.0.1:8787
 ```
 
-rather than hard-coding a LAN address.
+Startup logging identifies the service version and listening port.
 
----
+## Search API
 
-# Operational testing
+The primary endpoint is:
 
-A basic health/search test can be performed with `curl`.
-
-For example:
-
-```bash
-curl -sS --max-time 15 \
-  'http://127.0.0.1:8787/search?q=latest+news'
+```text
+POST /search
 ```
 
-The exact request parameters should follow the current API implementation.
+The service accepts a JSON search request and returns JSON containing the resulting search candidates and associated metadata.
 
-When diagnosing latency, measure the complete request rather than only the search-engine portion.
+A typical request is conceptually:
 
-For example:
-
-```bash
-time curl -sS --max-time 15 \
-  'http://127.0.0.1:8787/search?q=example'
+```json
+{
+  "query": "example search"
+}
 ```
 
----
+The exact request/response fields should be treated according to the running service implementation, rather than inferred from this README.
 
-# Failure philosophy
+## Content sources
+
+Each result can identify the source of its usable content.
+
+### `search_snippet`
+
+The result could not be usefully enhanced.
+
+The search-engine's original snippet is returned unchanged.
+
+### `article_http`
+
+The result was successfully retrieved over HTTP and processed through the article-enhancement pipeline.
+
+The result contains the original search snippet plus the generated extractive summary.
+
+## Time limits
+
+The service is deliberately bounded so that a slow web page does not hold an AI request indefinitely.
+
+Current limits include:
+
+```text
+REQUEST_DEADLINE = 12 seconds
+ENHANCE_BUDGET   = 7 seconds
+HTTP_TIMEOUT     = 6 seconds
+BROWSER_TIMEOUT  = 5 seconds
+SEARCH_TIMEOUT   = 6.5 seconds
+```
+
+These are implementation-level limits and may be adjusted as the service evolves.
+
+The important design constraint is that the complete request should remain comfortably within the approximately 15-second timeout used by the current Max integration.
+
+## Article enhancement concurrency
+
+HTTP article enhancement uses a bounded worker pool.
+
+Current configuration:
+
+```text
+HTTP_WORKERS = 3
+ENHANCE_GLOBAL_CONCURRENCY = 3
+TARGET_USABLE_ARTICLES = 2
+```
+
+The service does not attempt to enhance every search result indefinitely.
+
+It works toward obtaining a small number of useful article sources within the available time budget.
+
+This keeps latency predictable when search results contain slow, blocked, malformed, or otherwise unusable URLs.
+
+## Sumy
+
+Sumy provides the extractive summarisation stage of article enhancement.
+
+The current implementation uses Sumy's:
+
+* `Tokenizer`
+* `PlaintextParser`
+* `LexRankSummarizer`
+
+The summary is used as an enhancement to the search result rather than as a replacement for the original search-engine snippet.
+
+Consequently, when summarisation is unavailable or article retrieval fails, the original search result remains usable.
+
+## Security
+
+The HTTP retrieval path performs SSRF-related validation before retrieving result URLs.
+
+The service also limits HTTP retrieval rather than allowing arbitrary unbounded downloads.
+
+This is important because search results are externally supplied URLs and should not automatically be treated as trusted internal resources.
+
+The service is intended for use as a local/internal component, not as an unrestricted public web proxy.
+
+## Performance characteristics
+
+Typical successful searches should complete in a few seconds rather than tens of seconds.
+
+A normal successful path looks approximately like:
+
+```text
+Search
+  │
+  ├── search results
+  │
+  └── parallel HTTP enhancement
+          │
+          ├── article 1 → Readability → Sumy
+          ├── article 2 → Readability → Sumy
+          └── ...
+  │
+  ▼
+JSON response
+```
+
+Slow or failed article URLs do not cause the service to wait for browser fallbacks.
+
+Camoufox remains available for search operations rather than being consumed by article enhancement.
+
+Actual latency depends heavily on the search engine, network conditions, target websites, and whether browser-backed search is required.
+
+## Logging
+
+The service logs its startup configuration and significant search/enhancement events.
+
+Logs are intended to make it possible to distinguish:
+
+* search latency
+* HTTP retrieval failures
+* unusable article extraction
+* successful article enhancement
+* request deadline pressure
+* browser/search activity
+
+An HTTP enhancement failure is not itself an error requiring a browser retry. The expected behaviour is to retain the original search snippet.
+
+## Troubleshooting
+
+### Service starts but searches fail
+
+Check that the virtual environment contains the pinned dependencies:
+
+```bash
+venv/bin/python -m pip show camoufox httpx readability-lxml sumy
+```
+
+The expected direct dependency versions are:
+
+```text
+camoufox 0.5.5
+httpx 0.28.1
+readability-lxml 0.9
+sumy 0.13.0
+```
+
+### HTTP article enhancement frequently fails
+
+This does not necessarily indicate a service failure.
+
+Websites may:
+
+* block automated HTTP clients
+* require JavaScript
+* redirect repeatedly
+* return non-HTML content
+* expose very little readable article text
+* be unavailable or slow
+
+The expected result in these cases is the original search-engine snippet.
+
+The service does not currently escalate these failures into article-level Camoufox retrieval.
+
+### Searches are slow
+
+Look at the service log first.
+
+The principal things to distinguish are:
+
+1. search-engine/browser latency;
+2. HTTP article retrieval latency;
+3. request deadline pressure.
+
+Article enhancement is bounded and should not create an unbounded browser queue.
+
+### Port already in use
+
+The default port is `8787`.
+
+Check for an existing listener before starting another instance.
+
+## Design principles
 
 The service intentionally favours:
 
-```text
-fast + partial + trustworthy
-```
+* predictable latency over exhaustive retrieval;
+* useful evidence over maximum article coverage;
+* original search snippets as a reliable fallback;
+* direct HTTP retrieval whenever possible;
+* Readability rather than browser rendering for successful article retrieval;
+* extractive summarisation rather than opaque generative rewriting;
+* bounded concurrency;
+* a single controlled Camoufox instance;
+* explicit request deadlines;
+* SSRF protection;
+* simple JSON integration.
 
-over:
+The service is intended to be a retrieval component for another application, rather than a complete search UI.
 
-```text
-slow + exhaustive + fragile
-```
+## Current limitations
 
-A failed article should not invalidate a successful search.
+The service does not guarantee that every search result can be opened or summarised.
 
-A failed enhancement should not invalidate an article.
+In particular:
 
-A temporarily unavailable search engine should allow the fallback engine to be attempted.
+* JavaScript-only sites may not be retrievable through the HTTP enhancement path.
+* Websites can block automated requests.
+* Search-engine results can vary over time.
+* Search latency depends partly on the external search provider.
+* Article extraction quality depends on the target site's HTML.
+* Extractive summaries are summaries of retrieved text, not independently verified claims.
+* A failed HTTP enhancement currently falls back directly to the search snippet.
+* Camoufox is intentionally not used as an article-level fallback.
 
-A browser task that is no longer useful should not be allowed to consume resources indefinitely.
+## Evaluating the service
 
----
+A useful basic evaluation should test both the normal and degraded paths.
 
-# Current limitations
+### Normal search
 
-The current service intentionally does **not** provide:
+Use a query that produces several conventional web pages.
 
-* article retrieval through Camoufox fallback
-* unrestricted browser-based page fetching
-* exhaustive crawling
-* guaranteed retrieval of JavaScript-only articles
-* guaranteed extraction from every paywall or anti-bot system
-* a general-purpose user-callable URL-fetch API
+Check:
 
-The last point is important for integration with an AI frontend.
+* search completes within the expected latency;
+* results contain usable titles/URLs/snippets;
+* at least some candidates receive `article_http` enhancement where suitable pages are available.
 
-The service currently performs article retrieval **as part of search-result enhancement**. It is not yet a general `fetch(url)` tool for an LLM.
+### Difficult pages
 
-That distinction allows the search service to remain focused and predictable.
+Use queries likely to produce pages that block automated HTTP access or contain difficult HTML.
 
----
+Check that:
 
-# Intended integration with Max
+* the request still completes;
+* failed enhancement does not stall the entire request;
+* the original search-engine snippet remains intact;
+* no article-level Camoufox queue develops.
 
-The intended search flow is:
+### Repeated searches
 
-```text
-Max
- │
- ▼
-search query
- │
- ▼
-search_service
- │
- ├── search engine
- │
- ├── candidate URLs
- │
- └── article enhancement
- │
- ▼
-structured evidence
- │
- ▼
-Max reasoning
-```
+Run several searches consecutively.
 
-A future general-purpose fetch capability can be layered separately rather than turning the search service into a general web browser.
+The important property is that a slow or failed article URL from one request should not create stale browser work that materially delays the next search.
 
-This keeps two different operations distinct:
+## Integration role
+
+The intended architecture is:
 
 ```text
-SEARCH
-Find relevant sources.
-
-FETCH
-Retrieve a specific source.
+                  ┌─────────────────┐
+                  │      Max        │
+                  │ local AI client │
+                  └────────┬────────┘
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │  search_service │
+                  └────────┬────────┘
+                           │
+             ┌─────────────┴─────────────┐
+             │                           │
+             ▼                           ▼
+      Search provider              HTTP retrieval
+             │                           │
+             ▼                           ▼
+          Camoufox                 Readability
+                                         │
+                                         ▼
+                                       Sumy
+             │                           │
+             └─────────────┬─────────────┘
+                           ▼
+                     JSON evidence
 ```
 
-That separation is particularly useful for research workflows where Max may first discover a URL and subsequently decide that the complete page needs to be examined.
+Max can therefore treat the service as a relatively small, bounded retrieval primitive without needing to manage Camoufox, HTTP retrieval, Readability, or summarisation itself.
 
----
+## Licence
 
-# Version history
-
-## 7.0-fast
-
-Current architecture.
-
-Major characteristics:
-
-* 12-second overall request deadline.
-* 7-second enhancement budget.
-* Parallel HTTP article retrieval.
-* Local `readability-lxml` extraction.
-* Three HTTP enhancement workers.
-* Two usable article target.
-* Search-priority browser executor.
-* DuckDuckGo → Brave fallback.
-* No article-level Camoufox fallback.
-* Original search snippets preserved when enhancement fails.
-* Camoufox reserved for search operations.
-
-The removal of article-level browser fallback is intentional and is part of the current latency model.
-
----
-
-# Development principles
-
-Changes to this service should preserve the following properties:
-
-1. **Do not make search dependent on article enhancement.**
-2. **Do not allow a failed article to remove its search result.**
-3. **Do not reintroduce article-level Camoufox fallback without measuring its effect on search latency.**
-4. **Respect the overall request deadline.**
-5. **Keep outbound HTTP retrieval SSRF-safe.**
-6. **Keep browser concurrency bounded.**
-7. **Prefer deterministic degradation over indefinite retries.**
-8. **Preserve useful original search-engine evidence.**
-9. **Keep search and general-purpose URL fetching conceptually separate.**
-
----
-
-# Summary
-
-`search_service.py` is a local, latency-bounded web search and evidence extraction service.
-
-Its current architecture deliberately uses:
-
-```text
-Camoufox
-    → search
-
-HTTP
-    → article retrieval
-
-Readability
-    → article extraction
-
-Enhancement
-    → richer evidence
-
-Search snippet
-    → guaranteed fallback
-```
-
-The most important current architectural rule is:
-
-> **Camoufox searches; HTTP fetches articles.**
-
-This keeps the scarce browser resource available for the operation that actually requires it, while allowing ordinary article retrieval to happen concurrently and cheaply.
+MIT
